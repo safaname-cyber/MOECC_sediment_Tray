@@ -1,5 +1,5 @@
 /*  ============================================================================
- *   sediment.c  —  EyeROV Sediment Tray Controller  ·  FW v1.3.9
+ *   sediment.c  —  EyeROV Sediment Tray Controller  ·  FW v2.0.5
  *
  *   Target        :  ESP32-S3-WROOM-1
  *   Framework     :  ESP-IDF (FreeRTOS)
@@ -10,11 +10,12 @@
  *   Reference flow:  v3.1.8  (sediment_tray_flowchart_v3_1_8_complete.drawio)
  *   Authority     :  EyeROV SOP for Embedded Design v1.0  +  Design Review Checklist
  *
- *   Architecture  :  4 tasks  +  Option B servo bus ownership (queue-based)
+ *   Architecture  :  safety/status/json_cmd/weight/console + motion_task ([NO-POS-LIMIT])
+ *                    + Option B servo bus ownership (queue-based)
  *                    safety_task   P4 core0 1ms    WDT · limits · comms
  *                    status_task   P3 core0 100ms  SOLE UART2 TALKER:
  *                                                  motor telemetry + fault + hb + queue drain
- *                    json_cmd_task P2 core1 ev     UART1 I/O + 22 cmds inline
+ *                    json_cmd_task P2 core1 ev     UART1 I/O + 29 cmds inline
  *                    weight_task   P1 core1 20ms   HX711 + rolling avg + OVERWEIGHT
  *
  *   E-stop        :  COMMAND ONLY  —  no hardware pin  (GPIO 16 is reserved)
@@ -33,15 +34,47 @@
  *   SOP compliance notes:
  *     §4   real-time: WDT on safety/status/json_cmd, documented periods
  *     §6   comms: parser rejects malformed input defensively.
- *               NOTE (v1.3.2): 3-s host comms watchdog REMOVED by design —
- *               host silence does NOT trigger a fault. SOP §14 deviation.
+ *               [COMMS-RX-WDT] v1.4.0: host comms watchdog RE-ENABLED.
+ *               [DEV-PING] v2.0.x: the tray sends {"cmd":"ping","seq":N} on
+ *               UART1 (GPIO17/18, Ethernet converter) every 15 s; the host
+ *               must answer {"cmd":"pong","seq":N}. 3 missed pongs in a row
+ *               (counted from boot) → FAULT_COMMS_LOST (latched; reset_fault
+ *               clears). Motion refused until the first host message.
+ *     [LC-CAL] v1.5.0: grabber-style load-cell calibration ([ADD-44] port):
+ *               tare / cal_known / read_raw / set_cal / get_cal / cal_reset /
+ *               save_cal. Live changes are NOT persisted until save_cal, which
+ *               writes scale (float) AND tare offset (no boot auto-tare here).
+ *               set_scale / get_scale / raw_counts kept for ICD compatibility.
  *     §7   control: endstop-wait with timeout, saturation guards on servo regs
+ *               [MOTION-SUP] v1.6.0: position-based stall supervision on every
+ *               move (no progress / wrong direction → MOTION_STALL, latched);
+ *               on reaching the limit switch the servo HOLDS its present
+ *               position instead of driving on to the fixed goal.
+ *               Bench-only goto/jog commands behind MOTION_BENCH_JOG (default 0).
+ *               [SWITCH-STOP] v1.7.0: servo runs in WHEEL (speed) mode. Moves run
+ *               at MOTION_SPEED until the limit switch is seen, then speed 0 —
+ *               the limit switch is the ONLY normal stop. No goal positions.
+ *               Fault-only backstops: stall, wrong direction, overtravel
+ *               (MOTION_MAX_TRAVEL_COUNTS), ENDSTOP_TIMEOUT_MS.
+ *               [BENCH] v1.7.1: BENCH_MODE master switch — no Ethernet host
+ *               needed (comms watchdog self-fed), jog/goto built in, console
+ *               keywords `jog N` / `goto N`. NEVER flash BENCH_MODE 1 to a vehicle.
+ *               [PINS-MOECC2] v1.7.2: servo bus moved to the MOECC-2 board
+ *               pinout proven with the motor (winch_test / grabber): UART2
+ *               TX GPIO47, RX GPIO13, transceiver SHDN GPIO21 held HIGH,
+ *               auto-direction transceiver (no DE). DE on GPIO8 optional.
+ *               [NO-POS-LIMIT] v1.8.0: home/open/close run INDEFINITELY until
+ *               their limit switch — no travel limit, no timeout. Moves run in
+ *               motion_task so commands (halt / estop / ping) are always
+ *               served during a move. Kept: stall + wrong-direction (encoder),
+ *               current / voltage / temperature, estop, halt.
+ *               HX711 moved to the MOECC-2 load-cell header (GPIO41/42).
  *     §8   coding: NO dynamic allocation anywhere, explicit widths, NO recursion,
  *                  default-case switches, _Static_assert on scaling factors
  *     §9   concurrency: all shared globals accessed under mutex or marked volatile,
  *                       servo bus single-owner (Option B — no mutex needed)
- *     §14  safe states on: motor runaway, sensor fail, brownout, estop
- *               (comms-loss safe-state REMOVED by design — see §6 note above)
+ *     §14  safe states on: motor runaway, sensor fail, brownout, estop,
+ *               comms loss ([COMMS-RX-WDT] v1.4.0 — see §6 note above)
  *     §16  version string + build date + boot_count + reset_cause in boot event
  *  ========================================================================= */
 
@@ -55,6 +88,9 @@
 #include <math.h>
 #include <inttypes.h>
 #include <ctype.h>
+// [COMMS-RX-WDT] begin
+#include <stdatomic.h>
+// [COMMS-RX-WDT] end
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -79,7 +115,7 @@
  *   SECTION 1  ·  VERSION / BUILD
  *  ========================================================================= */
 
-#define FW_VERSION_STR            "1.3.9"
+#define FW_VERSION_STR            "2.0.5"
 #define FW_BUILD_DATE             __DATE__ " " __TIME__
 #ifndef FW_GIT_HASH
 #define FW_GIT_HASH               "release"
@@ -91,17 +127,24 @@ static const char *TAG            = "tray";
  *   SECTION 2  ·  PIN MAP   (ESP32-S3-WROOM-1)
  *  ========================================================================= */
 
-#define PIN_HX711_DOUT            GPIO_NUM_4
-#define PIN_HX711_SCK             GPIO_NUM_5
+#define PIN_HX711_DOUT            GPIO_NUM_41   // [NO-POS-LIMIT] MOECC-2 load-cell header (was GPIO4)
+#define PIN_HX711_SCK             GPIO_NUM_42   // [NO-POS-LIMIT] (was GPIO5)
 #define PIN_LIMIT_OPEN            GPIO_NUM_6
 #define PIN_LIMIT_CLOSED          GPIO_NUM_7
-#define PIN_RS485_DE              GPIO_NUM_8
+// [PINS-MOECC2] begin
+/* Servo RS-485 transceiver — MOECC-2 board (same as grabber / winch_test,
+ * proven with the RSBL motor). Auto-direction part: no DE line needed.    */
+#define PIN_RS485_SHDN            GPIO_NUM_21   /* driven HIGH = transceiver enabled */
+#define RS485_USE_SHDN            1
+#define PIN_RS485_DE              GPIO_NUM_8    /* only used if RS485_USE_DE = 1 */
+#define RS485_USE_DE              0             /* 1 = plain MAX485 with DE/RE on GPIO8 */
+// [PINS-MOECC2] end
 #define PIN_LOCK                  GPIO_NUM_10
 /*                                GPIO_NUM_16  — RESERVED (was ESTOP, removed v1.3.0) */
 #define PIN_UART1_TX              GPIO_NUM_17
 #define PIN_UART1_RX              GPIO_NUM_18
-#define PIN_UART2_TX              GPIO_NUM_21
-#define PIN_UART2_RX              GPIO_NUM_47
+#define PIN_UART2_TX              GPIO_NUM_47   // [PINS-MOECC2] was GPIO21
+#define PIN_UART2_RX              GPIO_NUM_13   // [PINS-MOECC2] was GPIO47
 #define PIN_STATUS_LED            GPIO_NUM_38
 #define PIN_FAULT_LED             GPIO_NUM_39
 
@@ -116,6 +159,28 @@ static const char *TAG            = "tray";
  *   SECTION 3  ·  TIMING / LIMITS / THRESHOLDS
  *  ========================================================================= */
 
+// [BENCH] begin
+/* ONE switch for bench / mechanical-assembly work on the USB console:
+ *   1 → no Ethernet host required (comms watchdog fed internally, motion
+ *       allowed from idf.py monitor), goto/jog commands + console keywords.
+ *   0 → production: host must ping on UART1, no jog.
+ * NEVER flash BENCH_MODE 1 to a vehicle.                                    */
+#define BENCH_MODE                0
+// [LOCK-OFF] begin
+/* Solenoid lock output on PIN_LOCK (GPIO10 — NOT yet confirmed on MOECC-2).
+ * Driving it HIGH power-cycled the board on the bench (rst POWERON), so in
+ * bench mode the pin is never configured or driven; lock / unlock only log.
+ * Set to 1 once the solenoid pin + supply are confirmed.                   */
+#define LOCK_OUTPUT_ENABLE        (!BENCH_MODE)   /* lock HW issue fixed 2026-11-23 — lock active outside bench mode */
+// [LOCK-OFF] end
+// [LC-OFF] begin
+/* 0 = load cell ignored: HX711 never read, weight stays invalid (weight_ok
+ * false, 0 g), no weight warnings / faults; tare, cal_known, read_raw
+ * return failure. Set 1 once the load cell reads correctly.               */
+#define LOADCELL_ENABLE           1
+// [LC-OFF] end
+// [BENCH] end
+
 /* --- Task periods ------------------------------------------------------- */
 #define SAFETY_PERIOD_MS          1
 #define STATUS_PERIOD_MS          100
@@ -123,22 +188,58 @@ static const char *TAG            = "tray";
 
 /* --- Watchdog / comms --------------------------------------------------- */
 #define TASK_WDT_TIMEOUT_MS       200
-/* COMMS_TIMEOUT_MS REMOVED (v1.3.2) — comms watchdog disabled by design.
- * Host silence does NOT trigger a fault in this firmware. g_last_rx_ms is
- * still tracked and visible via diag for host-side debugging only.         */
+// [COMMS-RX-WDT] begin
+/* Host comms watchdog (UART1 = GPIO17 TX / GPIO18 RX → UART-Ethernet).
+ * Replaces the v1.3.2 "COMMS_TIMEOUT_MS REMOVED" note.                     */
+#define COMMS_TEST_SELF_HEARTBEAT 0         /* 1 = Ethernet comms check DISABLED (bench only) */
+// [DEV-PING] begin
+/* Device ping: every COMMS_PING_INTERVAL_MS the firmware sends
+ *   {"cmd":"ping","seq":N,...}   on UART1 (Ethernet)
+ * and the host must answer {"cmd":"pong","seq":N} within that interval.
+ * COMMS_MAX_FAILS missed pongs in a row → FAULT_COMMS_LOST (latched).
+ * 0 = old mode: any valid host message per COMMS_CHECK_INTERVAL_MS window. */
+#define COMMS_DEVICE_PING_ENABLE  1
+#define COMMS_PING_INTERVAL_MS    15000     /* ping period = time allowed for the pong */
+#define COMMS_COUNT_FROM_BOOT     1         /* 1 = missed pongs count from power-on: no Ethernet
+                                               at all → COMMS_LOST after 3 pings (~45 s).
+                                               0 = count only after the first host message */
+// [DEV-PING] end
+#define COMMS_CHECK_INTERVAL_MS   10000     /* rx window (only when COMMS_DEVICE_PING_ENABLE 0) */
+#define COMMS_MAX_FAILS           3         /* consecutive missed windows / pongs → COMMS_LOST */
+// [COMMS-RX-WDT] end
 #define BOOT_GRACE_MS             500       /* skip limit/motor supervise during startup */
 
 /* --- Motion ------------------------------------------------------------- */
-#define ENDSTOP_TIMEOUT_MS        5000
+#define ENDSTOP_TIMEOUT_MS        5000      /* bench jog/goto only (see MOTION_ENDSTOP_TIMEOUT_MS) */
+// [NO-POS-LIMIT] begin
+#define MOTION_ENDSTOP_TIMEOUT_MS 0         /* home/open/close: 0 = run until the switch, no timeout */
+// [NO-POS-LIMIT] end
 #define LOCK_SETTLE_MS            500       /* solenoid pull-in / release */
 #define SERVO_REBOOT_WAIT_MS      500
-#define HOMING_STALL_MS           2000      /* position unchanged in HOMING */
-#define MOTION_ACCEL              50        /* 0x29 acceleration */
-#define MOTION_PWM_OPEN_SPEED     1000      /* 0x2C-0x2D PWM / open-loop speed */
-#define MOTION_SPEED              2400      /* 0x2E-0x2F running speed (0 at power-up = no motion) */
+// [MOTION-SUP] begin
+/* Position-based motion supervision (replaces the unused HOMING_STALL_MS). */
+#define MOTION_STALL_GRACE_MS     400       /* after goal: queue latency + accel */
+#define MOTION_STALL_WINDOW_MS    500       /* no progress for this long → stall */
+#define MOTION_STALL_MIN_COUNTS   20        /* progress = moved at least this    */
+#define MOTION_ARRIVE_TOL         30        /* bench goto: |pos-target| ≤ this = arrived */
+#define MOTION_WRONG_DIR_COUNTS   150       /* moved this far against the commanded direction → fault */
+#define MOTION_POS_STALE_MS       300       /* older position sample = not judged */
+#define MOTION_BENCH_JOG          BENCH_MODE   /* [BENCH] goto/jog commands (BENCH / ASSEMBLY ONLY) */
+// [MOTION-SUP] end
+// [SWITCH-STOP] begin
+/* Wheel (speed) mode: a move runs until its limit switch is seen. */
+#define MOTION_ACCEL              50        /* 0x29 acceleration (also the braking ramp) */
+#define MOTION_SPEED              4778      /* 0x2E-0x2F running speed: 70 RPM motor max = 70*4096/60 steps/s */
+#define MOTION_OPEN_DIR           (+1)      /* speed sign that OPENS the tray — bench: flip if reversed */
+#define MOTION_ENC_SIGN           (+1)      /* +1: positive speed increases the encoder count */
+#define MOTION_MAX_TRAVEL_COUNTS  0         /* [NO-POS-LIMIT] 0 = no travel limit (was 4500) */
+#define SERVO_MODE_WHEEL          1         /* 0x21: 0 = position, 1 = wheel / constant speed */
+#define SPEED_OPEN                ((int16_t)( MOTION_OPEN_DIR * MOTION_SPEED))
+#define SPEED_CLOSE               ((int16_t)(-MOTION_OPEN_DIR * MOTION_SPEED))
+// [SWITCH-STOP] end
 
 /* --- Heartbeat / supervision -------------------------------------------- */
-#define HEARTBEAT_PERIOD_MS       5000      /* BENCH ONLY — revert to 1000 before production flash */
+#define HEARTBEAT_PERIOD_MS       1000      /* production value (bench used 5000) */
 #define SERVO_STATUS_POLL_MS      1000      /* 1 Hz slow poll of 0x41 */
 
 /* --- Motor thresholds  (RSBL45-24 datasheet-derived) -------------------- */
@@ -176,14 +277,29 @@ static const char *TAG            = "tray";
 /* --- Limit switch debouncing -------------------------------------------- */
 #define LIMIT_DEBOUNCE_SAMPLES    8
 
-/* --- Servo mechanical range (bench-tune) -------------------------------- */
-#define SERVO_POS_CLOSED          100
-#define SERVO_POS_OPEN            3900
+/* --- Servo ------------------------------------------------------------- */
+/* [SWITCH-STOP] SERVO_POS_CLOSED / SERVO_POS_OPEN removed — no goal positions. */
 #define SERVO_ID                  0x01
 
 /* --- Load cell NVS defaults --------------------------------------------- */
 #define LC_DEFAULT_OFFSET         0
 #define LC_DEFAULT_SCALE_CPG      100
+// [LC-CAL] begin
+/* Grabber-style calibration (port of grabber [ADD-44]). */
+#define LC_SCALE_DEFAULT          ((float)LC_DEFAULT_SCALE_CPG)
+#define LIM_SCALE_ABS_MIN         1.0f      /* |counts per gram|; sign allowed (inverted bridge) */
+#define LIM_SCALE_ABS_MAX         100000.0f
+#define HX711_RAW_MIN             (-8388608L)   /* 24-bit two's complement */
+#define HX711_RAW_MAX             (8388607L)
+#define LC_TARE_SAMPLES_DEFAULT   HX711_TARE_SAMPLES
+#define LC_CAL_SAMPLES_DEFAULT    20
+#define LC_SAMPLES_MIN            1
+#define LC_SAMPLES_MAX            80
+#define LC_CAL_READ_TIMEOUT_MS    250       /* per sample; > one 10 SPS conversion */
+#define CAL_MASS_MIN_G            50.0f
+#define CAL_MIN_DELTA_COUNTS      500L      /* signal must clear noise */
+#define CAL_MAX_SPREAD_PCT        5.0f      /* max (max-min) as % of signal */
+// [LC-CAL] end
 
 /* --- JSON I/O ----------------------------------------------------------- */
 #define JSON_LINE_MAX_IN          512       /* longest incoming line we accept */
@@ -208,7 +324,9 @@ _Static_assert(JSON_LINE_BUF >= 512,
 #define SREG_TORQUE_ENABLE        0x28
 #define SREG_ACCEL                0x29
 #define SREG_GOAL_POS             0x2A
+#define SREG_GOAL_SPEED           0x2E      // [SWITCH-STOP] wheel-mode speed (bit15 = sign)
 #define SREG_PRESENT_POS          0x38
+#define SREG_PRESENT_SPEED        0x3A      // [RPM] signed (bit15 = direction), steps/s
 #define SREG_PRESENT_VOLT         0x3E
 #define SREG_PRESENT_TEMP         0x3F
 #define SREG_SERVO_STATUS         0x41
@@ -311,19 +429,28 @@ static const char *const FAULT_NAME[FAULT_COUNT_] = {
 };
 
 typedef enum {
-    SRV_CMD_GOAL = 0,
+    SRV_CMD_RUN = 0,            // [SWITCH-STOP] wheel speed (was SRV_CMD_GOAL)
     SRV_CMD_TORQUE_OFF,
     SRV_CMD_TORQUE_ON,
     SRV_CMD_REBOOT,
+    SRV_CMD_STOP,               // [SWITCH-STOP] speed 0, torque stays on (was SRV_CMD_HOLD)
 } srv_cmd_type_t;
 
 typedef struct {
     srv_cmd_type_t  type;
-    uint16_t        goal_pos;
+    int16_t         speed;      // [SWITCH-STOP] signed steps/s (was goal_pos)
     uint32_t        origin_seq;
 } srv_cmd_t;
 
 #define SERVO_CMD_Q_DEPTH         4
+
+// [LC-CAL] begin
+typedef enum {
+    LC_CAL_SRC_DEFAULT = 0,     /* compile-time default scale        */
+    LC_CAL_SRC_NVS,             /* matches what is stored in flash   */
+    LC_CAL_SRC_UNSAVED,         /* live change, not yet save_cal'd   */
+} lc_cal_src_t;
+// [LC-CAL] end
 
 /*  ============================================================================
  *   SECTION 6  ·  STATIC ASSERTIONS  (compile-time scaling safety — SOP §8.1)
@@ -341,10 +468,33 @@ _Static_assert(CURRENT_SAT_COUNTS <= 0x7FFF,
     "CURRENT_SAT_COUNTS must fit magnitude field (15 bits).");
 _Static_assert(HX711_RING_SIZE > 0 && ((HX711_RING_SIZE & (HX711_RING_SIZE - 1)) == 0),
     "HX711_RING_SIZE must be a positive power of two.");
-_Static_assert(SERVO_POS_CLOSED >= 0 && SERVO_POS_OPEN <= 4095,
-    "Servo goal positions must be within 12-bit encoder range.");
+// [SWITCH-STOP] begin
+_Static_assert(MOTION_OPEN_DIR == 1 || MOTION_OPEN_DIR == -1, "MOTION_OPEN_DIR must be +1 or -1");
+_Static_assert(MOTION_ENC_SIGN == 1 || MOTION_ENC_SIGN == -1, "MOTION_ENC_SIGN must be +1 or -1");
+_Static_assert(MOTION_SPEED > 0 && MOTION_SPEED <= 0x7FFF, "speed magnitude must fit 15 bits");
+_Static_assert(MOTION_MAX_TRAVEL_COUNTS == 0 || MOTION_MAX_TRAVEL_COUNTS > MOTION_WRONG_DIR_COUNTS,
+               "travel limit too small");
+// [SWITCH-STOP] end
 _Static_assert(JSON_LINE_MAX_IN >= 128,
     "JSON_LINE_MAX_IN must fit the longest expected command line.");
+// [MOTION-SUP] begin
+_Static_assert(MOTION_STALL_WINDOW_MS >= 3 * STATUS_PERIOD_MS,
+    "stall window must span several position samples (status_task period)");
+_Static_assert(MOTION_POS_STALE_MS >= 2 * STATUS_PERIOD_MS,
+    "position staleness limit must exceed one status_task period");
+_Static_assert(MOTION_STALL_GRACE_MS + MOTION_STALL_WINDOW_MS < ENDSTOP_TIMEOUT_MS,
+    "stall must be detectable before the endstop timeout");
+// [MOTION-SUP] end
+// [LC-CAL] begin
+_Static_assert(LC_DEFAULT_SCALE_CPG >= (int)LIM_SCALE_ABS_MIN &&
+               LC_DEFAULT_SCALE_CPG <= (int)LIM_SCALE_ABS_MAX,
+    "default scale must pass its own runtime validation");
+_Static_assert((int)CAL_MASS_MIN_G < (int)MAX_WEIGHT_G,
+    "minimum calibration mass must be inside the measurable weight range");
+_Static_assert(LC_TARE_SAMPLES_DEFAULT >= LC_SAMPLES_MIN && LC_TARE_SAMPLES_DEFAULT <= LC_SAMPLES_MAX &&
+               LC_CAL_SAMPLES_DEFAULT  >= LC_SAMPLES_MIN && LC_CAL_SAMPLES_DEFAULT  <= LC_SAMPLES_MAX,
+    "default sample counts must be inside the accepted range");
+// [LC-CAL] end
 
 /*  ============================================================================
  *   SECTION 7  ·  GLOBALS   (shared state — see SOP §9.2 / Checklist D)
@@ -365,7 +515,8 @@ static int32_t                  g_lc_ring[HX711_RING_SIZE];
 static uint8_t                  g_lc_ring_idx       = 0;
 static uint8_t                  g_lc_ring_filled    = 0;
 static int32_t                  g_lc_offset         = LC_DEFAULT_OFFSET;
-static int32_t                  g_lc_scale_cpg      = LC_DEFAULT_SCALE_CPG;
+static float                    g_lc_scale_cpg      = LC_SCALE_DEFAULT;   // [LC-CAL] float (was int32_t)
+static volatile lc_cal_src_t    g_lc_cal_src        = LC_CAL_SRC_DEFAULT; // [LC-CAL]
 static int32_t                  g_lc_last_raw       = 0;
 static int32_t                  g_lc_last_avg       = 0;
 static volatile float           g_weight_g          = 0.0f;
@@ -378,6 +529,8 @@ static volatile int32_t         g_motor_current_ma  = 0;
 static volatile int32_t         g_motor_voltage_dv  = 0;
 static volatile int32_t         g_motor_temp_c      = 0;
 static volatile int32_t         g_motor_pos         = -1;
+static volatile uint32_t        g_motor_pos_ms      = 0;    // [MOTION-SUP] time of last good position read
+static volatile int32_t         g_motor_speed_sps   = 0;    // [RPM] present speed, steps/s (signed)
 static volatile uint8_t         g_motor_servo_status = 0;
 static volatile bool            g_motor_ok          = false;
 static volatile uint32_t        g_motor_last_read_ms = 0;
@@ -396,6 +549,30 @@ static uint8_t                  g_trip_overtemp     = 0;
 
 /* --- Comms watchdog ----------------------------------------------------- */
 static volatile uint32_t        g_last_rx_ms        = 0;
+// [COMMS-RX-WDT] begin
+static _Atomic bool             g_comms_rx_flag     = false;  /* set by UART1 parser success */
+static _Atomic bool             g_comms_armed       = false;  /* first valid host msg seen   */
+static _Atomic uint32_t         g_comms_fail_cnt    = 0;      /* consecutive empty windows   */
+// [DEV-PING] begin
+static _Atomic bool             g_comms_pong_flag   = false;  /* matching pong since last ping */
+static _Atomic uint32_t         g_comms_ping_seq    = 0;      /* seq of the last device ping   */
+// [DEV-PING] end
+static portMUX_TYPE             g_comms_mux         = portMUX_INITIALIZER_UNLOCKED;
+static bool                     g_comms_rx_since_fault = false;  /* guarded by g_comms_mux */
+// [COMMS-RX-WDT] end
+
+// [NO-POS-LIMIT] begin
+/* --- Motion task --------------------------------------------------------- */
+typedef void (*motion_fn_t)(const char *raw, uint32_t seq);
+typedef struct {
+    motion_fn_t fn;
+    uint32_t    seq;
+    char        raw[JSON_LINE_MAX_IN + 1];
+} motion_req_t;
+static QueueHandle_t            g_motion_q          = NULL;
+static _Atomic bool             g_motion_busy       = false;   /* a move is queued / running */
+static _Atomic bool             g_motion_abort      = false;   /* set by halt; cleared per new move */
+// [NO-POS-LIMIT] end
 
 /* --- Limit switches (safety_task writes; others read) ------------------- */
 static volatile bool            g_lim_open          = false;
@@ -509,6 +686,37 @@ static bool parse_json_int_field(const char *raw, const char *key, int32_t *out_
     return true;
 }
 
+// [LC-CAL] begin
+/* ---- Parser: extract float value for a given key (grabber [ADD-44]) ---- */
+static bool parse_json_float_field(const char *raw, const char *key, float *out_value) {
+    if (raw == NULL || key == NULL || out_value == NULL) return false;
+
+    char key_pattern[40];
+    int klen = snprintf(key_pattern, sizeof(key_pattern), "\"%s\"", key);
+    if (klen <= 0 || klen >= (int)sizeof(key_pattern)) return false;
+
+    const char *key_pos = strstr(raw, key_pattern);
+    if (key_pos == NULL) return false;
+
+    const char *colon = strchr(key_pos + klen, ':');
+    if (colon == NULL) return false;
+
+    const char *p = colon + 1;
+    while (*p == ' ' || *p == '\t') p++;
+    if (!((*p >= '0' && *p <= '9') || *p == '-' || *p == '.')) return false;
+
+    char *end = NULL;
+    float v = strtof(p, &end);
+    if (end == NULL || end == p) return false;
+    while (*end == ' ' || *end == '\t') end++;
+    if (*end != ',' && *end != '}' && *end != '\0') return false;
+    if (!isfinite(v)) return false;
+
+    *out_value = v;
+    return true;
+}
+// [LC-CAL] end
+
 /* ---- Parser: cheap presence test for an optional key ------------------- */
 static bool parse_json_has_key(const char *raw, const char *key) {
     if (raw == NULL || key == NULL) return false;
@@ -564,6 +772,7 @@ static const char *mode_name_str(void);
 static esp_err_t nvs_restore_calibration(void);
 static esp_err_t nvs_save_tare(int32_t offset);
 static esp_err_t nvs_save_scale(int32_t scale_cpg);
+static esp_err_t nvs_save_cal(float scale_cpg, int32_t offset);   // [LC-CAL]
 static void      nvs_update_boot_count(void);
 
 /* GPIO + lock */
@@ -583,7 +792,7 @@ static esp_err_t servo_read(uint8_t id, uint8_t addr, uint8_t n, uint8_t *out);
 static esp_err_t servo_write(uint8_t id, uint8_t addr, const uint8_t *data, uint8_t n);
 static esp_err_t servo_reboot_cmd(uint8_t id);
 static esp_err_t servo_set_torque(uint8_t id, bool enable);
-static esp_err_t servo_set_goal(uint8_t id, uint16_t pos);
+static esp_err_t servo_set_speed(uint8_t id, int16_t speed);   // [SWITCH-STOP] (was servo_set_goal)
 static esp_err_t servo_configure_protection(uint8_t id);
 
 /* Fault handling */
@@ -640,6 +849,21 @@ static const char *mode_name_str(void) {
     return (g_mode < MODE_COUNT_) ? MODE_NAME[g_mode] : "?";
 }
 
+// [RPM] begin
+/* present speed → output-shaft RPM (4096 encoder steps per turn) */
+static float motor_rpm(void) {
+    return (float)g_motor_speed_sps * 60.0f / 4096.0f;
+}
+// [RPM] end
+
+// [LC-CAL] begin
+static bool lc_scale_valid(float s) {
+    if (!isfinite(s)) return false;
+    float a = fabsf(s);
+    return (a >= LIM_SCALE_ABS_MIN) && (a <= LIM_SCALE_ABS_MAX);
+}
+// [LC-CAL] end
+
 /*  ============================================================================
  *   SECTION 10  ·  NVS PERSISTENCE
  *  ========================================================================= */
@@ -648,6 +872,7 @@ static const char *mode_name_str(void) {
 #define NVS_KEY_OFFSET            "lc_offset"
 #define NVS_KEY_SCALE             "lc_scale"
 #define NVS_KEY_BOOTS             "boots"
+#define NVS_KEY_SCALE_F           "lc_scale_f"   // [LC-CAL] float blob, counts per gram
 
 static esp_err_t nvs_restore_calibration(void) {
     esp_err_t err = nvs_open(NVS_NS, NVS_READWRITE, &g_nvs_h);
@@ -658,16 +883,34 @@ static esp_err_t nvs_restore_calibration(void) {
     int32_t v;
     if (nvs_get_i32(g_nvs_h, NVS_KEY_OFFSET, &v) == ESP_OK) {
         g_lc_offset = v;
+        g_lc_cal_src = LC_CAL_SRC_NVS;                       // [LC-CAL]
         ESP_LOGI(TAG, "restored tare offset = %" PRId32, v);
     } else {
         g_lc_offset = LC_DEFAULT_OFFSET;
     }
     if (nvs_get_i32(g_nvs_h, NVS_KEY_SCALE, &v) == ESP_OK && v > 0) {
-        g_lc_scale_cpg = v;
+        g_lc_scale_cpg = (float)v;                           // [LC-CAL] cast
+        g_lc_cal_src = LC_CAL_SRC_NVS;                       // [LC-CAL]
         ESP_LOGI(TAG, "restored scale_cpg = %" PRId32, v);
     } else {
-        g_lc_scale_cpg = LC_DEFAULT_SCALE_CPG;
+        g_lc_scale_cpg = LC_SCALE_DEFAULT;                   // [LC-CAL]
     }
+    // [LC-CAL] begin
+    /* Float scale (save_cal / set_scale) wins over the legacy integer key. */
+    {
+        float f = 0.0f;
+        size_t sz = sizeof(f);
+        if (nvs_get_blob(g_nvs_h, NVS_KEY_SCALE_F, &f, &sz) == ESP_OK && sz == sizeof(f)) {
+            if (lc_scale_valid(f)) {
+                g_lc_scale_cpg = f;
+                g_lc_cal_src   = LC_CAL_SRC_NVS;
+                ESP_LOGI(TAG, "restored scale (float) = %.4f counts/g", (double)f);
+            } else {
+                ESP_LOGW(TAG, "stored float scale invalid — ignored");
+            }
+        }
+    }
+    // [LC-CAL] end
     uint32_t b;
     g_boot_count = (nvs_get_u32(g_nvs_h, NVS_KEY_BOOTS, &b) == ESP_OK) ? b : 0;
     return ESP_OK;
@@ -682,10 +925,28 @@ static esp_err_t nvs_save_tare(int32_t offset) {
 
 static esp_err_t nvs_save_scale(int32_t scale_cpg) {
     esp_err_t err = nvs_set_i32(g_nvs_h, NVS_KEY_SCALE, scale_cpg);
+    // [LC-CAL] begin
+    /* Keep the float key in step, or boot would restore an older save_cal value. */
+    if (err == ESP_OK) {
+        float f = (float)scale_cpg;
+        err = nvs_set_blob(g_nvs_h, NVS_KEY_SCALE_F, &f, sizeof(f));
+    }
+    // [LC-CAL] end
     if (err == ESP_OK) err = nvs_commit(g_nvs_h);
     if (err != ESP_OK) ESP_LOGE(TAG, "nvs_save_scale failed: %s", esp_err_to_name(err));
     return err;
 }
+
+// [LC-CAL] begin
+/* save_cal: scale (float + legacy int key) and tare offset, one commit each path. */
+static esp_err_t nvs_save_cal(float scale_cpg, int32_t offset) {
+    esp_err_t err = nvs_set_blob(g_nvs_h, NVS_KEY_SCALE_F, &scale_cpg, sizeof(scale_cpg));
+    if (err == ESP_OK) err = nvs_set_i32(g_nvs_h, NVS_KEY_SCALE, (int32_t)lroundf(scale_cpg));
+    if (err == ESP_OK) err = nvs_save_tare(offset);      /* sets lc_offset + commits */
+    if (err != ESP_OK) ESP_LOGE(TAG, "nvs_save_cal failed: %s", esp_err_to_name(err));
+    return err;
+}
+// [LC-CAL] end
 
 static void nvs_update_boot_count(void) {
     g_boot_count++;
@@ -698,9 +959,25 @@ static void nvs_update_boot_count(void) {
  *   SECTION 11  ·  GPIO + LOCK
  *  ========================================================================= */
 
+// [LOCK-STATE] begin
+/* Commanded lock state. GPIO10 is output-only, and gpio_get_level() on an
+ * output-only pin always reads 0 (= "engaged") — so the pin must never be
+ * read back; this variable is the single source of truth.                 */
+static volatile bool g_lock_engaged = true;
+
+static void lock_set(bool engaged) {
+#if LOCK_OUTPUT_ENABLE
+    gpio_set_level(PIN_LOCK, engaged ? LOCK_ENGAGED_LEVEL : LOCK_DISENGAGED_LEVEL);
+#endif
+    g_lock_engaged = engaged;
+}
+// [LOCK-STATE] end
+
 static void gpio_setup(void) {
     gpio_config_t out_cfg = {
-        .pin_bit_mask = (1ULL << PIN_RS485_DE) | (1ULL << PIN_LOCK) |
+        .pin_bit_mask = (RS485_USE_DE   ? (1ULL << PIN_RS485_DE)   : 0) |   // [PINS-MOECC2]
+                        (RS485_USE_SHDN ? (1ULL << PIN_RS485_SHDN) : 0) |
+                        (LOCK_OUTPUT_ENABLE ? (1ULL << PIN_LOCK) : 0) |   // [LOCK-OFF]
                         (1ULL << PIN_STATUS_LED) | (1ULL << PIN_FAULT_LED) |
                         (1ULL << PIN_HX711_SCK),
         .mode         = GPIO_MODE_OUTPUT,
@@ -720,21 +997,37 @@ static void gpio_setup(void) {
     };
     ESP_ERROR_CHECK(gpio_config(&in_cfg));
 
-    gpio_set_level(PIN_LOCK,       LOCK_ENGAGED_LEVEL);
+    lock_set(true);                                         // [LOCK-STATE] boot: locked
+    // [PINS-MOECC2] begin
+#if RS485_USE_DE
     gpio_set_level(PIN_RS485_DE,   0);
+#endif
+#if RS485_USE_SHDN
+    gpio_set_level(PIN_RS485_SHDN, 1);              /* enable the transceiver */
+#endif
+    // [PINS-MOECC2] end
     gpio_set_level(PIN_STATUS_LED, 0);
     gpio_set_level(PIN_FAULT_LED,  0);
     gpio_set_level(PIN_HX711_SCK,  0);
 }
 
 static void lock_engage(void) {
-    gpio_set_level(PIN_LOCK, LOCK_ENGAGED_LEVEL);
+#if LOCK_OUTPUT_ENABLE                                      // [LOCK-OFF]
+    if (g_lock_engaged) return;                     // [LOCK-STATE] already locked: nothing to do
+    lock_set(true);
     vTaskDelay_ms(LOCK_SETTLE_MS);
+#else
+    ESP_LOGI(TAG, "lock engage skipped (LOCK_OUTPUT_ENABLE 0)");
+#endif
 }
 
 static void lock_disengage(void) {
-    gpio_set_level(PIN_LOCK, LOCK_DISENGAGED_LEVEL);
+#if LOCK_OUTPUT_ENABLE                                      // [LOCK-OFF]
+    lock_set(false);                                        // [LOCK-STATE]
     vTaskDelay_ms(LOCK_SETTLE_MS);
+#else
+    ESP_LOGI(TAG, "lock disengage skipped (LOCK_OUTPUT_ENABLE 0)");
+#endif
 }
 
 /*  ============================================================================
@@ -790,8 +1083,8 @@ static int32_t loadcell_current_avg(void) {
 }
 
 static float loadcell_counts_to_grams(int32_t counts) {
-    if (g_lc_scale_cpg <= 0) return 0.0f;
-    return (float)(counts - g_lc_offset) / (float)g_lc_scale_cpg;
+    if (!lc_scale_valid(g_lc_scale_cpg)) return 0.0f;                 // [LC-CAL] negative scale allowed
+    return (float)(counts - g_lc_offset) / g_lc_scale_cpg;
 }
 
 /*  ============================================================================
@@ -808,10 +1101,14 @@ static uint8_t servo_checksum(const uint8_t *pkt, size_t n) {
 static esp_err_t servo_tx_rx(const uint8_t *tx, size_t tx_len,
                              uint8_t *rx, size_t rx_len, uint32_t rx_timeout_ms) {
     uart_flush_input(UART_SERVO);
+#if RS485_USE_DE                                    // [PINS-MOECC2]
     gpio_set_level(PIN_RS485_DE, 1);
+#endif
     int w = uart_write_bytes(UART_SERVO, (const char *)tx, tx_len);
     uart_wait_tx_done(UART_SERVO, pdMS_TO_TICKS(50));
+#if RS485_USE_DE                                    // [PINS-MOECC2]
     gpio_set_level(PIN_RS485_DE, 0);
+#endif
     if (w != (int)tx_len) return ESP_FAIL;
     if (rx_len == 0) return ESP_OK;
     int r = uart_read_bytes(UART_SERVO, rx, rx_len, pdMS_TO_TICKS(rx_timeout_ms));
@@ -872,18 +1169,27 @@ static esp_err_t servo_set_torque(uint8_t id, bool enable) {
     return servo_write(id, SREG_TORQUE_ENABLE, &v, 1);
 }
 
-static esp_err_t servo_set_goal(uint8_t id, uint16_t pos) {
-    if (pos > 4095) pos = 4095;
-    /* One contiguous write 0x29..0x2F: ACCEL, GOAL_POS, PWM_OPEN_SPEED, SPEED.
-     * SPEED (0x2E) defaults to 0 at power-up on RSBL45-24 — goal alone won't move. */
+// [SWITCH-STOP] begin
+/* Feetech sign-magnitude speed word: bit15 = direction, bits0-14 = steps/s. */
+static uint16_t servo_speed_word(int16_t speed) {
+    int32_t  sp  = speed;
+    uint16_t mag = (uint16_t)(((sp < 0) ? -sp : sp) & 0x7FFF);
+    return (sp < 0) ? (uint16_t)(mag | 0x8000u) : mag;
+}
+
+/* Wheel mode: one contiguous write 0x29..0x2F (ACCEL, goal 0, time 0, SPEED),
+ * same block the Feetech SMS_STS WriteSpe() uses. Speed 0 = stop.          */
+static esp_err_t servo_set_speed(uint8_t id, int16_t speed) {
+    uint16_t w = servo_speed_word(speed);
     uint8_t d[7] = {
         (uint8_t)MOTION_ACCEL,
-        (uint8_t)(pos & 0xFFu),                         (uint8_t)((pos >> 8) & 0xFFu),
-        (uint8_t)(MOTION_PWM_OPEN_SPEED & 0xFFu),       (uint8_t)((MOTION_PWM_OPEN_SPEED >> 8) & 0xFFu),
-        (uint8_t)(MOTION_SPEED & 0xFFu),                (uint8_t)((MOTION_SPEED >> 8) & 0xFFu),
+        0u, 0u,                                   /* goal position — unused in wheel mode */
+        0u, 0u,                                   /* time — unused                        */
+        (uint8_t)(w & 0xFFu), (uint8_t)((w >> 8) & 0xFFu),
     };
     return servo_write(id, SREG_ACCEL, d, sizeof(d));
 }
+// [SWITCH-STOP] end
 
 /*  ============================================================================
  *   SECTION 15  ·  servo_configure_protection
@@ -914,9 +1220,10 @@ static esp_err_t servo_configure_protection(uint8_t id) {
     err = servo_write(id, SREG_LOCK_FLAG, &v, 1);
     if (err != ESP_OK) { ESP_LOGE(TAG, "EEPROM unlock failed"); return err; }
 
-    /* Force position (servo) mode — the servo may have been left in wheel
-     * mode (1) by other firmware, in which case GOAL_POS is ignored.     */
-    v = 0;
+    /* [SWITCH-STOP] Force WHEEL (speed) mode: the motor runs until the
+     * firmware sees the limit switch and commands speed 0. In position
+     * mode the servo would stop at its own goal instead.                 */
+    v = SERVO_MODE_WHEEL;
     if (servo_write(id, SREG_MODE, &v, 1) != ESP_OK)
         ESP_LOGW(TAG, "MODE write failed");
 
@@ -952,6 +1259,8 @@ static esp_err_t servo_configure_protection(uint8_t id) {
 
 static const char *const FAULT_ALLOWED_CMDS[] = {
     "nop", "status", "version", "diag", "weigh",
+    "ping", "pong",                             // [COMMS-RX-WDT] [DEV-PING]
+    "get_cal", "read_raw",                      // [LC-CAL] queries only
     "motor_diag", "servo_status", "raw_counts", "get_scale", "pos_query",
     "lock", "unlock", "halt", "estop", "reset_fault",
     NULL
@@ -965,16 +1274,24 @@ static bool fault_is_cmd_allowed(const char *cmd) {
     return false;
 }
 
+static portMUX_TYPE g_fault_mux = portMUX_INITIALIZER_UNLOCKED;   // [LOGIC-FIX] atomic first-fault-wins
+
 static void fault_raise(fault_name_t f, const char *src, int32_t val, uint32_t seq) {
-    if (g_fault_latched) return;    /* first fault wins */
-    g_fault = f;
-    strncpy(g_fault_src, src ? src : "", sizeof(g_fault_src) - 1);
-    g_fault_src[sizeof(g_fault_src) - 1] = '\0';
-    g_fault_val = val;
-    g_fault_seq = seq;
-    g_fault_latched = true;
-    g_mode = MODE_FAULT;
-    g_homed = false;
+    bool first;
+    taskENTER_CRITICAL(&g_fault_mux);                       // [LOGIC-FIX]
+    first = !g_fault_latched;                               /* first fault wins */
+    if (first) {
+        g_fault = f;
+        strncpy(g_fault_src, src ? src : "", sizeof(g_fault_src) - 1);
+        g_fault_src[sizeof(g_fault_src) - 1] = '\0';
+        g_fault_val = val;
+        g_fault_seq = seq;
+        g_fault_latched = true;
+        g_mode = MODE_FAULT;
+        g_homed = false;
+    }
+    taskEXIT_CRITICAL(&g_fault_mux);
+    if (!first) return;
     gpio_set_level(PIN_FAULT_LED, 1);
     ESP_LOGE(TAG, "FAULT %s src=%s val=%" PRId32, FAULT_NAME[f], g_fault_src, val);
     emit_safe_state();
@@ -1005,9 +1322,28 @@ static void fault_clear_if_resolved(bool *out_success, const char **out_reason) 
             if (g_weight_g <= (MAX_WEIGHT_G - 10.0f)) *out_success = true;
             else *out_reason = "weight still above capacity";
             break;
-        case FAULT_COMMS_LOST:
+        case FAULT_COMMS_LOST: {
+            // [COMMS-RX-WDT] begin
+            /* [COMMS-CLEAR] reset_fault always clears COMMS_LOST (user request).
+             * Counters restart, so a still-dead link re-latches after
+             * COMMS_MAX_FAILS more missed pongs.                              */
+            bool rx_back;
+            taskENTER_CRITICAL(&g_comms_mux);
+            rx_back = g_comms_rx_since_fault;
+            g_comms_rx_since_fault = false;
+            taskEXIT_CRITICAL(&g_comms_mux);
+            atomic_store(&g_comms_fail_cnt, 0u);
+            atomic_store(&g_comms_rx_flag, false);
+#if COMMS_DEVICE_PING_ENABLE
+            atomic_store(&g_comms_pong_flag, false);
+#endif
+            if (!rx_back)
+                ESP_LOGW(TAG, "COMMS_LOST cleared without host traffic — re-latches after %d missed pongs",
+                         COMMS_MAX_FAILS);
             *out_success = true;
+            // [COMMS-RX-WDT] end
             break;
+        }
         case FAULT_ESTOP:
         case FAULT_MOTOR_SENSOR_INVALID:
         case FAULT_MOTION_STALL:
@@ -1132,9 +1468,12 @@ static void emit_cmd_complete(uint32_t seq, const char *cmd,
 static void emit_heartbeat(void) {
     uart1_send_json("{\"event\":\"heartbeat\",\"seq\":0,"
                     "\"weight_g\":%.2f,\"weight_ok\":%s,"
-                    "\"motor_ok\":%s,\"fault\":\"%s\",\"uptime_ms\":%u" TRAILER_FMT "}",
+                    "\"motor_ok\":%s,\"rpm\":%.1f,\"current_ma\":%ld,\"voltage_v\":%.1f,"   // [RPM]
+                    "\"temp_c\":%ld,\"fault\":\"%s\",\"uptime_ms\":%u" TRAILER_FMT "}",
                     (double)g_weight_g, FBOOL(g_weight_ok),
-                    FBOOL(g_motor_ok), FAULT_NAME[g_fault], (unsigned)ms_now(), TRAILER_ARGS);
+                    FBOOL(g_motor_ok), (double)motor_rpm(), (long)g_motor_current_ma,
+                    g_motor_voltage_dv / 10.0, (long)g_motor_temp_c,
+                    FAULT_NAME[g_fault], (unsigned)ms_now(), TRAILER_ARGS);
 }
 
 static void emit_limit_hit(const char *which, uint32_t seq) {
@@ -1187,8 +1526,8 @@ static void emit_reset_result(bool success, const char *reason, uint32_t seq) {
  *   SECTION 19  ·  MOTION PRIMITIVES
  *  ========================================================================= */
 
-static bool post_servo_cmd(srv_cmd_type_t type, uint16_t pos, uint32_t seq) {
-    srv_cmd_t c = { .type = type, .goal_pos = pos, .origin_seq = seq };
+static bool post_servo_cmd(srv_cmd_type_t type, int16_t speed, uint32_t seq) {   // [SWITCH-STOP]
+    srv_cmd_t c = { .type = type, .speed = speed, .origin_seq = seq };
     if (!g_servo_cmd_q) return false;
     BaseType_t ok = xQueueSend(g_servo_cmd_q, &c, pdMS_TO_TICKS(100));
     if (ok != pdPASS) {
@@ -1198,19 +1537,113 @@ static bool post_servo_cmd(srv_cmd_type_t type, uint16_t pos, uint32_t seq) {
     return true;
 }
 
-static bool wait_for_limit(volatile bool *flag, uint32_t timeout_ms, uint32_t seq) {
-    (void)seq;
+// [MOTION-SUP] begin
+/* Motion supervisor (fault backstops only — the limit switch is the stop).
+ * [SWITCH-STOP] direction-based for wheel mode: accumulates signed travel
+ * from the encoder (wrap-aware, single-turn 0..4095) and judges it against
+ * the COMMANDED direction:
+ *   - no forward progress for MOTION_STALL_WINDOW_MS  → MOTION_STALL pos_stall
+ *   - moved MOTION_WRONG_DIR_COUNTS backwards        → MOTION_STALL wrong_dir
+ *   - travelled more than max_travel (if > 0)        → ENDSTOP_TIMEOUT overtravel
+ * Uses the position cache written by status_task (bus single-owner kept).
+ * Stale samples are not judged — telemetry loss is MOTOR_SENSOR_INVALID's job. */
+typedef struct {
+    uint32_t t0;
+    uint32_t ref_ms;
+    int32_t  last_pos;      /* last fresh encoder sample, -1 = none yet */
+    int32_t  travel;        /* signed counts, + = commanded direction   */
+    int32_t  ref_travel;
+    int8_t   dir;           /* commanded speed sign (+1 / -1)           */
+} stall_mon_t;
+
+static bool pos_fresh(void) {
+    return (g_motor_pos >= 0) && ((ms_now() - g_motor_pos_ms) <= MOTION_POS_STALE_MS);
+}
+
+/* shortest signed step between two single-turn encoder readings */
+static int32_t enc_delta(int32_t now_pos, int32_t prev_pos) {
+    int32_t d = (now_pos - prev_pos) % 4096;
+    if (d >  2047) d -= 4096;
+    if (d < -2048) d += 4096;
+    return d;
+}
+
+static void stall_mon_init(stall_mon_t *m, int8_t dir) {
+    m->t0         = ms_now();
+    m->ref_ms     = m->t0;
+    m->last_pos   = pos_fresh() ? g_motor_pos : -1;
+    m->travel     = 0;
+    m->ref_travel = 0;
+    m->dir        = dir;
+}
+
+/* true → a fault was raised */
+static bool stall_mon_check(stall_mon_t *m, uint32_t seq, int32_t max_travel) {
+    uint32_t now   = ms_now();
+    bool     fresh = pos_fresh();
+    int32_t  pos   = g_motor_pos;
+
+    if (fresh) {
+        if (m->last_pos >= 0) m->travel += enc_delta(pos, m->last_pos) * MOTION_ENC_SIGN * m->dir;
+        m->last_pos = pos;
+    }
+    if (!fresh || (now - m->t0) < MOTION_STALL_GRACE_MS) {
+        m->ref_ms     = now;
+        m->ref_travel = m->travel;
+        return false;
+    }
+    if (m->travel < -MOTION_WRONG_DIR_COUNTS) {
+        ESP_LOGE(TAG, "motion wrong direction: travel=%ld (dir %d) — check MOTION_ENC_SIGN",
+                 (long)m->travel, (int)m->dir);
+        fault_raise(FAULT_MOTION_STALL, "wrong_dir", m->travel, seq);
+        return true;
+    }
+    if (max_travel > 0 && m->travel > max_travel) {
+        ESP_LOGE(TAG, "overtravel: %ld counts without the limit switch", (long)m->travel);
+        fault_raise(FAULT_ENDSTOP_TIMEOUT, "overtravel", m->travel, seq);
+        return true;
+    }
+    if ((m->travel - m->ref_travel) >= MOTION_STALL_MIN_COUNTS) {
+        m->ref_ms     = now;
+        m->ref_travel = m->travel;
+        return false;
+    }
+    if ((now - m->ref_ms) >= MOTION_STALL_WINDOW_MS) {
+        ESP_LOGE(TAG, "motion stall: no progress for %u ms (pos=%ld travel=%ld)",
+                 (unsigned)(now - m->ref_ms), (long)pos, (long)m->travel);
+        fault_raise(FAULT_MOTION_STALL, "pos_stall", pos, seq);
+        return true;
+    }
+    return false;
+}
+// [MOTION-SUP] end
+
+/* [SWITCH-STOP] Wait for the limit switch while the motor runs at speed.
+ * Returns true ONLY when the switch is seen; false on fault / timeout.     */
+static bool wait_for_limit(volatile bool *flag, uint32_t timeout_ms, uint32_t seq,
+                           int16_t speed) {
+    // [WDT-WAIT] begin
+    /* json_cmd_task (host path) is TWDT-subscribed with a 2 s timeout, but
+     * this wait can last ENDSTOP_TIMEOUT_MS (5 s). console_task is not
+     * subscribed, so only feed when the calling task is.                  */
+    const bool feed_wdt = (esp_task_wdt_status(NULL) == ESP_OK);
+    // [WDT-WAIT] end
+    stall_mon_t mon;
+    stall_mon_init(&mon, (int8_t)((speed < 0) ? -1 : 1));
     uint32_t start = ms_now();
-    while ((ms_now() - start) < timeout_ms) {
+    while (timeout_ms == 0 || (ms_now() - start) < timeout_ms) {   // [NO-POS-LIMIT] 0 = forever
+        if (feed_wdt) esp_task_wdt_reset();     // [WDT-WAIT]
         if (g_fault_latched) return false;
+        if (atomic_load(&g_motion_abort)) return false;            // [NO-POS-LIMIT] halt
         if (*flag) return true;
+        if (stall_mon_check(&mon, seq, MOTION_MAX_TRAVEL_COUNTS)) return false;
         vTaskDelay_ms(10);
     }
     return false;
 }
 
 /*  ============================================================================
- *   SECTION 20  ·  COMMAND HANDLERS   (all 22 cmds from ICD v3.1.8 §2)
+ *   SECTION 20  ·  COMMAND HANDLERS   (22 cmds from ICD v3.1.8 §2 + ping + 6 grabber-style cal cmds)
  *
  *   Signature:   void cmd_<name>(const char *raw, uint32_t seq);
  *     raw  — the full NUL-terminated JSON input line (for optional-field extraction)
@@ -1223,6 +1656,24 @@ static bool wait_for_limit(volatile bool *flag, uint32_t timeout_ms, uint32_t se
 /* ---------- §2.1  Diagnostics & query  (cached response) --------------- */
 
 static void cmd_nop(const char *raw, uint32_t seq) { (void)raw; emit_ack(seq); }
+// [COMMS-RX-WDT] begin
+/* Host keep-alive. Replies pong, touches no state (rx flag is set by the
+ * dispatcher, like every other valid host command).                       */
+// [DEV-PING] begin
+/* {"cmd":"pong","seq":N} — host reply to a device ping. Handled in the
+ * dispatcher (UART1 only); nothing is sent back.                          */
+static void cmd_pong(const char *raw, uint32_t seq) {
+    (void)raw;
+    (void)seq;
+}
+// [DEV-PING] end
+
+static void cmd_ping(const char *raw, uint32_t seq) {
+    (void)raw;
+    uart1_send_json("{\"resp\":\"pong\",\"seq\":%u" TRAILER_FMT "}",
+                    (unsigned)seq, TRAILER_ARGS);
+}
+// [COMMS-RX-WDT] end
 
 static void cmd_status(const char *raw, uint32_t seq) {
     (void)raw;
@@ -1231,16 +1682,17 @@ static void cmd_status(const char *raw, uint32_t seq) {
                     "\"weight_g\":%.2f,\"weight_ok\":%s,"
                     "\"fault\":\"%s\","
                     "\"motor\":{\"voltage_v\":%.1f,\"temp_c\":%ld,"
-                              "\"current_ma\":%ld,\"ok\":%s}"
+                              "\"current_ma\":%ld,\"rpm\":%.1f,\"ok\":%s}"   // [RPM]
                     TRAILER_FMT "}",
                     (unsigned)seq,
                     mode_name(g_mode),
-                    FBOOL(gpio_get_level(PIN_LOCK) == LOCK_ENGAGED_LEVEL),
+                    FBOOL(g_lock_engaged),                                   // [LOCK-STATE]
                     FBOOL(g_homed),
                     (double)g_weight_g, FBOOL(g_weight_ok),
                     FAULT_NAME[g_fault],
                     (double)g_motor_voltage_dv / 10.0,
                     (long)g_motor_temp_c, (long)g_motor_current_ma,
+                    (double)motor_rpm(),                                     // [RPM]
                     FBOOL(g_motor_ok),
                     TRAILER_ARGS);
 }
@@ -1277,7 +1729,7 @@ static void cmd_diag(const char *raw, uint32_t seq) {
                               "\"parse_err\":%u,\"last_rx_ms\":%u,"
                               "\"tx_trunc\":%u},"
                     "\"motor\":{\"voltage_dv\":%ld,\"temp_c\":%ld,"
-                              "\"current_ma\":%ld,\"pos\":%ld,"
+                              "\"current_ma\":%ld,\"pos\":%ld,\"rpm\":%.1f,"   // [RPM]
                               "\"servo_status\":%u,\"last_read_ms\":%u,"
                               "\"bad_reads\":%u,"
                               "\"trip_oc\":%u,\"trip_ov\":%u,"
@@ -1295,13 +1747,13 @@ static void cmd_diag(const char *raw, uint32_t seq) {
                     (unsigned)g_parse_err_count, (unsigned)g_last_rx_ms,
                     (unsigned)g_tx_trunc_count,
                     (long)g_motor_voltage_dv, (long)g_motor_temp_c,
-                    (long)g_motor_current_ma, (long)g_motor_pos,
+                    (long)g_motor_current_ma, (long)g_motor_pos, (double)motor_rpm(),   // [RPM]
                     (unsigned)g_motor_servo_status, (unsigned)g_motor_last_read_ms,
                     (unsigned)g_motor_bad_reads_consec,
                     (unsigned)g_trip_overcurrent, (unsigned)g_trip_overvoltage,
                     (unsigned)g_trip_undervoltage, (unsigned)g_trip_overtemp,
                     (double)g_weight_g, (long)g_lc_offset,
-                    (long)g_lc_scale_cpg, (long)g_lc_last_raw,
+                    (long)lroundf(g_lc_scale_cpg), (long)g_lc_last_raw,
                     FBOOL(g_weight_stable),
                     (unsigned)ms_now());
 }
@@ -1320,14 +1772,15 @@ static void cmd_motor_diag(const char *raw, uint32_t seq) {
     uint32_t age = ms_now() - g_motor_last_read_ms;
     uart1_send_json("{\"resp\":\"motor_diag\",\"seq\":%u,"
                     "\"voltage_v\":%.1f,\"temp_c\":%ld,\"current_ma\":%ld,"
-                    "\"position\":%ld,\"ok\":%s,"
+                    "\"position\":%ld,\"rpm\":%.1f,\"speed_sps\":%ld,\"ok\":%s,"   // [RPM]
                     "\"warn_current\":%s,\"warn_temp\":%s,"
                     "\"bad_reads_consec\":%u,\"last_read_age_ms\":%u"
                     TRAILER_FMT "}",
                     (unsigned)seq,
                     (double)g_motor_voltage_dv / 10.0,
                     (long)g_motor_temp_c, (long)g_motor_current_ma,
-                    (long)g_motor_pos, FBOOL(g_motor_ok),
+                    (long)g_motor_pos, (double)motor_rpm(), (long)g_motor_speed_sps,   // [RPM]
+                    FBOOL(g_motor_ok),
                     FBOOL(g_warn_current_latched), FBOOL(g_warn_temp_latched),
                     (unsigned)g_motor_bad_reads_consec, (unsigned)age,
                     TRAILER_ARGS);
@@ -1358,7 +1811,7 @@ static void cmd_raw_counts(const char *raw, uint32_t seq) {
                     TRAILER_FMT "}",
                     (unsigned)seq,
                     (long)g_lc_last_raw, (long)g_lc_last_avg,
-                    (long)g_lc_offset, (long)g_lc_scale_cpg,
+                    (long)g_lc_offset, (long)lroundf(g_lc_scale_cpg),
                     (double)g_weight_g,
                     TRAILER_ARGS);
 }
@@ -1367,13 +1820,13 @@ static void cmd_get_scale(const char *raw, uint32_t seq) {
     (void)raw;
     uart1_send_json("{\"resp\":\"get_scale\",\"seq\":%u,"
                     "\"scale_cpg\":%ld" TRAILER_FMT "}",
-                    (unsigned)seq, (long)g_lc_scale_cpg, TRAILER_ARGS);
+                    (unsigned)seq, (long)lroundf(g_lc_scale_cpg), TRAILER_ARGS);
 }
 
 static void cmd_selftest(const char *raw, uint32_t seq) {
     (void)raw;
     bool gpio_ok     = true;
-    bool lock_ok     = (gpio_get_level(PIN_LOCK) == LOCK_ENGAGED_LEVEL);
+    bool lock_ok     = g_lock_engaged;                       // [LOCK-STATE]
     bool nvs_ok      = (g_nvs_h != 0);
     bool limits_ok   = true;
     bool loadcell_ok = (g_weight_ok && g_lc_ring_filled > 0);
@@ -1393,45 +1846,345 @@ static void cmd_selftest(const char *raw, uint32_t seq) {
 
 /* ---------- §2.2  Load-cell configuration ------------------------------ */
 
-static void cmd_tare(const char *raw, uint32_t seq) {
-    (void)raw;
-    if (g_mode != MODE_CLOSED_LOCKED) { emit_nak(seq, "bad_state"); return; }
-    if (!g_weight_stable)             { emit_nak(seq, "not_stable"); return; }
+// [LC-CAL] begin
+/* Grabber [ADD-44] calibration service, sediment edition.
+ *  - HX711 sampled inline in the calling task, holding g_lc_mutex for the
+ *    whole window (weight_task pauses; no interleaved conversions).
+ *  - Replies: grabber event shapes + sediment ,"seq",mode/t trailer.
+ *  - Nothing is persisted until save_cal.                                  */
 
-    int64_t sum = 0;
-    uint8_t got = 0;
-    for (uint8_t i = 0; i < HX711_TARE_SAMPLES * 2 && got < HX711_TARE_SAMPLES; i++) {
-        int32_t r;
-        xSemaphoreTake(g_lc_mutex, portMAX_DELAY);
-        bool ok = hx711_read_blocking(&r, HX711_READ_TIMEOUT_US);
-        xSemaphoreGive(g_lc_mutex);
-        if (ok) { sum += r; got++; }
-        else    { vTaskDelay_ms(20); }
+/* JSON-safe fixed-point formatting. Non-finite / out-of-range → null. */
+static const char *fmt_fixed(char *buf, size_t len, float v, int decimals) {
+    const float mul = (decimals == 4) ? 10000.0f : 100.0f;
+    if (!isfinite(v) || fabsf(v * mul) > 2.0e9f) {
+        snprintf(buf, len, "null");
+        return buf;
+    }
+    int32_t c = (int32_t)lroundf(v * mul);
+    int32_t a = (c < 0) ? -c : c;
+    if (decimals == 4) {
+        snprintf(buf, len, "%s%ld.%04ld", (c < 0) ? "-" : "",
+                 (long)(a / 10000), (long)(a % 10000));
+    } else {
+        snprintf(buf, len, "%s%ld.%02ld", (c < 0) ? "-" : "",
+                 (long)(a / 100), (long)(a % 100));
+    }
+    return buf;
+}
+
+static const char *lc_src_name(lc_cal_src_t src) {
+    switch (src) {
+        case LC_CAL_SRC_DEFAULT: return "default";
+        case LC_CAL_SRC_NVS:     return "nvs";
+        case LC_CAL_SRC_UNSAVED: return "unsaved";
+        default:                 return "unknown";
+    }
+}
+
+static void reply_bad_arg(const char *cmd, uint32_t seq, const char *reason) {
+    ESP_LOGW(TAG, "%s: %s", cmd, reason);
+    uart1_send_json("{\"event\":\"error\",\"cmd\":\"%s\",\"msg\":\"%s\",\"seq\":%u"
+                    TRAILER_FMT "}", cmd, reason, (unsigned)seq, TRAILER_ARGS);
+}
+
+/* Optional "samples": absent → default, present → must be in range. */
+static bool parse_samples_field(const char *raw, int32_t def, int32_t *out) {
+    *out = def;
+    if (!parse_json_has_key(raw, "samples")) return true;
+    int32_t v = 0;
+    if (!parse_json_int_field(raw, "samples", &v)) return false;
+    if (v < LC_SAMPLES_MIN || v > LC_SAMPLES_MAX) return false;
+    *out = v;
+    return true;
+}
+
+/* Calibration writes only while the tray is not moving. */
+static bool lc_mode_allows_cal(void) {
+    tray_mode_t m = g_mode;
+    return (m == MODE_IDLE || m == MODE_CLOSED_LOCKED || m == MODE_OPEN);
+}
+
+typedef struct {
+    int32_t avg;
+    int32_t min;
+    int32_t max;
+    bool    ok;       /* false if ANY read in the window timed out */
+} lc_sample_t;
+
+/* Wait for HX711 DOUT low, yielding (no busy-wait). */
+static bool lc_wait_ready(uint32_t timeout_ms) {
+    uint32_t t0 = ms_now();
+    while (gpio_get_level(PIN_HX711_DOUT) != 0) {
+        if ((ms_now() - t0) >= timeout_ms) return false;
+        vTaskDelay(1);
+    }
+    return true;
+}
+
+static lc_sample_t lc_sample_raw(int32_t n) {
+    lc_sample_t s = { 0, INT32_MAX, INT32_MIN, false };
+#if !LOADCELL_ENABLE                                        // [LC-OFF]
+    (void)n;
+    ESP_LOGW(TAG, "load cell disabled (LOADCELL_ENABLE 0)");
+    return s;
+#endif
+    if (n < LC_SAMPLES_MIN || n > LC_SAMPLES_MAX) return s;
+
+    /* json_cmd_task is WDT-subscribed (2 s); console_task is not. */
+    const bool feed_wdt = (esp_task_wdt_status(NULL) == ESP_OK);
+    int64_t sum    = 0;
+    bool    all_ok = true;
+
+    xSemaphoreTake(g_lc_mutex, portMAX_DELAY);
+    for (int32_t i = 0; i < n; i++) {
+        if (feed_wdt) esp_task_wdt_reset();
+        int32_t v = 0;
+        if (!lc_wait_ready(LC_CAL_READ_TIMEOUT_MS) ||
+            !hx711_read_blocking(&v, HX711_READ_TIMEOUT_US)) {
+            all_ok = false;
+            break;
+        }
+        sum += v;
+        if (v < s.min) s.min = v;
+        if (v > s.max) s.max = v;
+    }
+    xSemaphoreGive(g_lc_mutex);
+
+    if (all_ok) {
+        s.avg = (int32_t)(sum / n);
+        s.ok  = true;
+    }
+    return s;
+}
+
+/* {"cmd":"tare"[,"samples":N]}  →  {"event":"tare_result",...}
+ * [LC-CAL] replaces the v1.4.0 tare (closed_locked + stable only, fixed 10
+ * samples, saved to NVS immediately).                                      */
+static void cmd_tare(const char *raw, uint32_t seq) {
+    if (!lc_mode_allows_cal()) { emit_nak(seq, "bad_state"); return; }
+    int32_t n = LC_TARE_SAMPLES_DEFAULT;
+    if (!parse_samples_field(raw, LC_TARE_SAMPLES_DEFAULT, &n)) {
+        reply_bad_arg("tare", seq, "samples_out_of_range");
+        return;
     }
 
-    if (got < HX711_TARE_SAMPLES) {
-        uart1_send_json("{\"resp\":\"tare\",\"seq\":%u,"
-                        "\"success\":false,\"reason\":\"sampling_failed\""
-                        TRAILER_FMT "}",
+    lc_sample_t s = lc_sample_raw(n);
+    if (!s.ok) {
+        ESP_LOGE(TAG, "tare FAILED: HX711 timeout — offset unchanged (%ld)",
+                 (long)g_lc_offset);
+        uart1_send_json("{\"event\":\"tare_result\",\"success\":false,"
+                        "\"samples\":%ld,\"reason\":\"hx711_timeout\",\"seq\":%u"
+                        TRAILER_FMT "}", (long)n, (unsigned)seq, TRAILER_ARGS);
+        return;
+    }
+
+    xSemaphoreTake(g_lc_mutex, portMAX_DELAY);
+    g_lc_offset  = s.avg;
+    g_lc_cal_src = LC_CAL_SRC_UNSAVED;
+    xSemaphoreGive(g_lc_mutex);
+
+    ESP_LOGI(TAG, "tare complete: offset=%ld (%ld samples, spread %ld) — not saved",
+             (long)s.avg, (long)n, (long)(s.max - s.min));
+    uart1_send_json("{\"event\":\"tare_result\",\"success\":true,"
+                    "\"samples\":%ld,\"offset\":%ld,\"spread\":%ld,\"saved\":false,"
+                    "\"seq\":%u" TRAILER_FMT "}",
+                    (long)n, (long)s.avg, (long)(s.max - s.min),
+                    (unsigned)seq, TRAILER_ARGS);
+}
+
+/* {"cmd":"cal_known","mass_g":X[,"samples":N]}  →  cal_result known_mass
+ * scale = (raw_avg - offset) / mass_g. Tare (empty) first.                 */
+static void cmd_cal_known(const char *raw, uint32_t seq) {
+    if (!lc_mode_allows_cal()) { emit_nak(seq, "bad_state"); return; }
+    float   mass = 0.0f;
+    int32_t n    = LC_CAL_SAMPLES_DEFAULT;
+    if (!parse_json_float_field(raw, "mass_g", &mass) ||
+        mass < CAL_MASS_MIN_G || mass > MAX_WEIGHT_G) {
+        reply_bad_arg("cal_known", seq, "mass_g_missing_or_out_of_range");
+        return;
+    }
+    if (!parse_samples_field(raw, LC_CAL_SAMPLES_DEFAULT, &n)) {
+        reply_bad_arg("cal_known", seq, "samples_out_of_range");
+        return;
+    }
+
+    lc_sample_t s      = lc_sample_raw(n);
+    int32_t     offset = g_lc_offset;
+    int32_t     delta  = 0;
+    int32_t     spread = 0;
+    float       new_scale = NAN;
+    const char *why    = NULL;
+
+    if (!s.ok) {
+        why = "hx711_timeout";
+    } else {
+        delta  = s.avg - offset;
+        spread = s.max - s.min;
+        int32_t adelta = (delta < 0) ? -delta : delta;
+        if (adelta < CAL_MIN_DELTA_COUNTS) {
+            why = "signal_too_small";               /* no mass, or no tare */
+        } else if ((float)spread > (float)adelta * (CAL_MAX_SPREAD_PCT / 100.0f)) {
+            why = "unstable_load";                  /* swinging / settling  */
+        } else {
+            new_scale = (float)delta / mass;
+            if (!lc_scale_valid(new_scale)) why = "scale_out_of_range";
+        }
+    }
+
+    char b1[24], b2[24], b3[24];
+    if (why != NULL) {
+        ESP_LOGW(TAG, "cal_known REJECTED (%s): mass=%s g raw=%ld offset=%ld delta=%ld spread=%ld",
+                 why, fmt_fixed(b1, sizeof(b1), mass, 2), (long)s.avg, (long)offset,
+                 (long)delta, (long)spread);
+        uart1_send_json("{\"event\":\"cal_result\",\"action\":\"known_mass\","
+                        "\"success\":false,\"reason\":\"%s\",\"mass_g\":%s,"
+                        "\"raw\":%ld,\"offset\":%ld,\"delta\":%ld,\"spread\":%ld,"
+                        "\"seq\":%u" TRAILER_FMT "}",
+                        why, fmt_fixed(b1, sizeof(b1), mass, 2),
+                        (long)s.avg, (long)offset, (long)delta, (long)spread,
                         (unsigned)seq, TRAILER_ARGS);
         return;
     }
 
-    int32_t new_offset = (int32_t)(sum / got);
+    float prev;
     xSemaphoreTake(g_lc_mutex, portMAX_DELAY);
-    g_lc_offset = new_offset;
+    prev           = g_lc_scale_cpg;
+    g_lc_scale_cpg = new_scale;
+    g_lc_cal_src   = LC_CAL_SRC_UNSAVED;
     xSemaphoreGive(g_lc_mutex);
 
-    if (nvs_save_tare(new_offset) != ESP_OK) {
-        fault_raise(FAULT_NVS_FAILED, "tare", 0, seq);
+    ESP_LOGW(TAG, "CALIBRATED: scale %s -> %s counts/g (mass %s g, delta %ld, spread %ld). "
+             "NOT saved — send save_cal to persist.",
+             fmt_fixed(b2, sizeof(b2), prev, 4), fmt_fixed(b3, sizeof(b3), new_scale, 4),
+             fmt_fixed(b1, sizeof(b1), mass, 2), (long)delta, (long)spread);
+    uart1_send_json("{\"event\":\"cal_result\",\"action\":\"known_mass\","
+                    "\"success\":true,\"mass_g\":%s,\"raw\":%ld,\"offset\":%ld,"
+                    "\"delta\":%ld,\"spread\":%ld,\"scale\":%s,\"prev_scale\":%s,"
+                    "\"saved\":false,\"seq\":%u" TRAILER_FMT "}",
+                    fmt_fixed(b1, sizeof(b1), mass, 2), (long)s.avg, (long)offset,
+                    (long)delta, (long)spread,
+                    fmt_fixed(b3, sizeof(b3), new_scale, 4),
+                    fmt_fixed(b2, sizeof(b2), prev, 4),
+                    (unsigned)seq, TRAILER_ARGS);
+}
+
+/* {"cmd":"read_raw"[,"samples":N]}  →  raw_result (avg/min/max/offset/w_g) */
+static void cmd_read_raw(const char *raw, uint32_t seq) {
+    int32_t n = LC_TARE_SAMPLES_DEFAULT;
+    if (!parse_samples_field(raw, LC_TARE_SAMPLES_DEFAULT, &n)) {
+        reply_bad_arg("read_raw", seq, "samples_out_of_range");
+        return;
+    }
+    lc_sample_t s     = lc_sample_raw(n);
+    int32_t     off   = g_lc_offset;
+    float       scale = g_lc_scale_cpg;
+    float       w     = (s.ok && lc_scale_valid(scale)) ? (float)(s.avg - off) / scale : NAN;
+    char b1[24];
+    uart1_send_json("{\"event\":\"raw_result\",\"success\":%s,"
+                    "\"samples\":%ld,\"raw_avg\":%ld,\"raw_min\":%ld,"
+                    "\"raw_max\":%ld,\"offset\":%ld,\"w_g\":%s,\"seq\":%u"
+                    TRAILER_FMT "}",
+                    FBOOL(s.ok), (long)n, (long)s.avg, (long)s.min, (long)s.max,
+                    (long)off, fmt_fixed(b1, sizeof(b1), w, 2),
+                    (unsigned)seq, TRAILER_ARGS);
+}
+
+/* {"cmd":"set_cal"[,"scale":X][,"offset":N]}  →  cal_result set (live only) */
+static void cmd_set_cal(const char *raw, uint32_t seq) {
+    if (!lc_mode_allows_cal()) { emit_nak(seq, "bad_state"); return; }
+    bool    has_scale  = parse_json_has_key(raw, "scale");
+    bool    has_offset = parse_json_has_key(raw, "offset");
+    float   sc  = 0.0f;
+    int32_t off = 0;
+
+    if (has_scale && (!parse_json_float_field(raw, "scale", &sc) || !lc_scale_valid(sc))) {
+        reply_bad_arg("set_cal", seq, "scale_out_of_range");
+        return;
+    }
+    if (has_offset && (!parse_json_int_field(raw, "offset", &off) ||
+                       off < HX711_RAW_MIN || off > HX711_RAW_MAX)) {
+        reply_bad_arg("set_cal", seq, "offset_out_of_range");
+        return;
+    }
+    if (!has_scale && !has_offset) {
+        reply_bad_arg("set_cal", seq, "need_scale_or_offset");
+        return;
     }
 
-    uart1_send_json("{\"resp\":\"tare\",\"seq\":%u,"
-                    "\"success\":true,\"tare_counts\":%ld,\"samples\":%u"
-                    TRAILER_FMT "}",
-                    (unsigned)seq, (long)new_offset, (unsigned)got,
-                    TRAILER_ARGS);
+    float   cur_sc;
+    int32_t cur_off;
+    xSemaphoreTake(g_lc_mutex, portMAX_DELAY);
+    if (has_scale)  g_lc_scale_cpg = sc;
+    if (has_offset) g_lc_offset    = off;
+    g_lc_cal_src = LC_CAL_SRC_UNSAVED;
+    cur_sc  = g_lc_scale_cpg;
+    cur_off = g_lc_offset;
+    xSemaphoreGive(g_lc_mutex);
+
+    char b1[24];
+    ESP_LOGW(TAG, "set_cal: scale=%s offset=%ld (live, not saved)",
+             fmt_fixed(b1, sizeof(b1), cur_sc, 4), (long)cur_off);
+    uart1_send_json("{\"event\":\"cal_result\",\"action\":\"set\","
+                    "\"success\":true,\"scale\":%s,\"offset\":%ld,\"saved\":false,"
+                    "\"seq\":%u" TRAILER_FMT "}",
+                    fmt_fixed(b1, sizeof(b1), cur_sc, 4), (long)cur_off,
+                    (unsigned)seq, TRAILER_ARGS);
 }
+
+/* {"cmd":"get_cal"}  →  {"event":"cal",...} */
+static void cmd_get_cal(const char *raw, uint32_t seq) {
+    (void)raw;
+    char b1[24], b2[24];
+    uart1_send_json("{\"event\":\"cal\",\"reason\":\"queried\",\"scale\":%s,"
+                    "\"offset\":%ld,\"default_scale\":%s,\"source\":\"%s\","
+                    "\"units\":\"counts_per_g\",\"seq\":%u" TRAILER_FMT "}",
+                    fmt_fixed(b1, sizeof(b1), g_lc_scale_cpg, 4), (long)g_lc_offset,
+                    fmt_fixed(b2, sizeof(b2), LC_SCALE_DEFAULT, 4),
+                    lc_src_name(g_lc_cal_src), (unsigned)seq, TRAILER_ARGS);
+}
+
+/* {"cmd":"cal_reset"}  →  scale back to compile-time default (live only) */
+static void cmd_cal_reset(const char *raw, uint32_t seq) {
+    (void)raw;
+    if (!lc_mode_allows_cal()) { emit_nak(seq, "bad_state"); return; }
+    xSemaphoreTake(g_lc_mutex, portMAX_DELAY);
+    g_lc_scale_cpg = LC_SCALE_DEFAULT;
+    g_lc_cal_src   = LC_CAL_SRC_DEFAULT;
+    xSemaphoreGive(g_lc_mutex);
+    char b1[24];
+    ESP_LOGW(TAG, "cal_reset: scale back to default %s (flash unchanged until save_cal)",
+             fmt_fixed(b1, sizeof(b1), LC_SCALE_DEFAULT, 4));
+    uart1_send_json("{\"event\":\"cal_result\",\"action\":\"reset\","
+                    "\"success\":true,\"scale\":%s,\"saved\":false,\"seq\":%u"
+                    TRAILER_FMT "}",
+                    fmt_fixed(b1, sizeof(b1), LC_SCALE_DEFAULT, 4),
+                    (unsigned)seq, TRAILER_ARGS);
+}
+
+/* {"cmd":"save_cal"}  →  persist scale AND offset to NVS */
+static void cmd_save_cal(const char *raw, uint32_t seq) {
+    (void)raw;
+    float   sc;
+    int32_t off;
+    xSemaphoreTake(g_lc_mutex, portMAX_DELAY);
+    sc  = g_lc_scale_cpg;
+    off = g_lc_offset;
+    xSemaphoreGive(g_lc_mutex);
+
+    bool ok = (nvs_save_cal(sc, off) == ESP_OK);
+    if (ok) g_lc_cal_src = LC_CAL_SRC_NVS;
+
+    char b1[24];
+    if (ok) ESP_LOGW(TAG, "save_cal: scale %s offset %ld committed to NVS",
+                     fmt_fixed(b1, sizeof(b1), sc, 4), (long)off);
+    else    ESP_LOGE(TAG, "save_cal: NVS write FAILED");
+    uart1_send_json("{\"event\":\"cal_result\",\"action\":\"save\","
+                    "\"success\":%s,\"scale\":%s,\"offset\":%ld,\"seq\":%u"
+                    TRAILER_FMT "}",
+                    FBOOL(ok), fmt_fixed(b1, sizeof(b1), sc, 4), (long)off,
+                    (unsigned)seq, TRAILER_ARGS);
+}
+// [LC-CAL] end
 
 static void cmd_set_scale(const char *raw, uint32_t seq) {
     int32_t new_scale = 0;
@@ -1441,11 +2194,13 @@ static void cmd_set_scale(const char *raw, uint32_t seq) {
     }
 
     xSemaphoreTake(g_lc_mutex, portMAX_DELAY);
-    g_lc_scale_cpg = new_scale;
+    g_lc_scale_cpg = (float)new_scale;                       // [LC-CAL] cast
     xSemaphoreGive(g_lc_mutex);
 
     if (nvs_save_scale(new_scale) != ESP_OK) {
         fault_raise(FAULT_NVS_FAILED, "set_scale", 0, seq);
+    } else if (g_lc_cal_src != LC_CAL_SRC_UNSAVED) {          // [LC-CAL]
+        g_lc_cal_src = LC_CAL_SRC_NVS;                       // [LC-CAL]
     }
 
     uart1_send_json("{\"resp\":\"set_scale\",\"seq\":%u,"
@@ -1472,13 +2227,14 @@ static void cmd_reset_fault(const char *raw, uint32_t seq) {
 
 static void cmd_halt(const char *raw, uint32_t seq) {
     (void)raw;
+    atomic_store(&g_motion_abort, true);            // [NO-POS-LIMIT] stop a running move
     emit_ack(seq);
     (void)post_servo_cmd(SRV_CMD_TORQUE_OFF, 0, seq);
     bool was_moving = (g_mode == MODE_OPENING || g_mode == MODE_CLOSING ||
                        g_mode == MODE_HOMING  || g_mode == MODE_UNLOCKING ||
                        g_mode == MODE_LOCKING);
     g_homed = false;
-    set_mode(MODE_IDLE, seq);
+    if (!g_fault_latched) set_mode(MODE_IDLE, seq);         // [LOGIC-FIX] never hide a latched fault
     if (was_moving) {
         emit_cmd_complete(seq, "halt", "halted", NULL, 0, NULL);
     }
@@ -1498,13 +2254,21 @@ static void cmd_servo_reboot(const char *raw, uint32_t seq) {
 
 static void cmd_lock(const char *raw, uint32_t seq) {
     (void)raw;
-    gpio_set_level(PIN_LOCK, LOCK_ENGAGED_LEVEL);
+#if LOCK_OUTPUT_ENABLE                                      // [LOCK-OFF]
+    lock_set(true);                                         // [LOCK-STATE]
+#else
+    ESP_LOGW(TAG, "lock: output disabled (LOCK_OUTPUT_ENABLE 0) — GPIO10 not driven");
+#endif
     emit_ack(seq);
 }
 
 static void cmd_unlock(const char *raw, uint32_t seq) {
     (void)raw;
-    gpio_set_level(PIN_LOCK, LOCK_DISENGAGED_LEVEL);
+#if LOCK_OUTPUT_ENABLE                                      // [LOCK-OFF]
+    lock_set(false);                                        // [LOCK-STATE]
+#else
+    ESP_LOGW(TAG, "unlock: output disabled (LOCK_OUTPUT_ENABLE 0) — GPIO10 not driven");
+#endif
     emit_ack(seq);
 }
 
@@ -1512,24 +2276,38 @@ static void cmd_unlock(const char *raw, uint32_t seq) {
 
 static void cmd_home(const char *raw, uint32_t seq) {
     (void)raw;
-    if (!(g_mode == MODE_IDLE || g_mode == MODE_CLOSED_LOCKED)) {
+    if (!(g_mode == MODE_IDLE || g_mode == MODE_CLOSED_LOCKED || g_mode == MODE_OPEN)) {   // [LOGIC-FIX] + open
         emit_nak(seq, "bad_state");
         return;
     }
     uint32_t t0 = ms_now();
     emit_ack(seq);
 
-    lock_disengage();
+    /* [HOME-LOCK] Already at home (closed switch pressed): no unlock, no
+     * motion — just make sure it is locked. Not at home: unlock, run to the
+     * closed switch, then lock.                                            */
     set_mode(MODE_HOMING, seq);
-    if (!post_servo_cmd(SRV_CMD_TORQUE_ON, 0, seq)) return;
-    if (!post_servo_cmd(SRV_CMD_GOAL, SERVO_POS_CLOSED, seq)) return;
-
-    if (!wait_for_limit(&g_lim_closed, ENDSTOP_TIMEOUT_MS, seq)) {
-        if (!g_fault_latched) {
-            fault_raise(FAULT_HOMING_FAILED, "endstop_timeout", 0, seq);
+    if (!g_lim_closed) {                                    // [LOGIC-FIX] already at the switch: no motion
+        lock_disengage();                                   // [HOME-LOCK] not at home → unlock first
+        if (atomic_load(&g_motion_abort)) {                 // halted during the unlock delay
+            if (!g_fault_latched) set_mode(MODE_IDLE, seq);
+            return;
         }
-        emit_cmd_complete(seq, "home", "fault", FAULT_NAME[g_fault], ms_now() - t0, NULL);
-        return;
+        if (!post_servo_cmd(SRV_CMD_TORQUE_ON, 0, seq)) return;
+        if (!post_servo_cmd(SRV_CMD_RUN, SPEED_CLOSE, seq)) return;           // [SWITCH-STOP]
+
+        if (!wait_for_limit(&g_lim_closed, MOTION_ENDSTOP_TIMEOUT_MS, seq, SPEED_CLOSE)) {   // [NO-POS-LIMIT]
+            if (atomic_load(&g_motion_abort)) {                // [NO-POS-LIMIT] halted (reported by halt)
+                if (!g_fault_latched) set_mode(MODE_IDLE, seq);   // [LOGIC-FIX] never leave a motion mode
+                return;
+            }
+            if (!g_fault_latched) {
+                fault_raise(FAULT_HOMING_FAILED, "endstop_timeout", 0, seq);
+            }
+            emit_cmd_complete(seq, "home", "fault", FAULT_NAME[g_fault], ms_now() - t0, NULL);
+            return;
+        }
+        (void)post_servo_cmd(SRV_CMD_STOP, 0, seq);            // [SWITCH-STOP] switch → stop
     }
 
     set_mode(MODE_LOCKING, seq);
@@ -1544,8 +2322,13 @@ static void cmd_home(const char *raw, uint32_t seq) {
 
 static void cmd_open(const char *raw, uint32_t seq) {
     (void)raw;
-    if (g_mode != MODE_CLOSED_LOCKED) { emit_nak(seq, "bad_state"); return; }
-    if (!g_homed)                     { emit_nak(seq, "not_homed"); return; }
+#if BENCH_MODE                                              // [BENCH] no mode / homing checks
+    /* any state: runs toward OPEN until the open limit switch */
+#else
+    /* [HALT-RESUME] open from closed_locked or idle (e.g. after halt); the
+     * open limit switch ends the move, so homing first is not required.   */
+    if (!(g_mode == MODE_CLOSED_LOCKED || g_mode == MODE_IDLE)) { emit_nak(seq, "bad_state"); return; }
+#endif
 
     /* Capacity check — rolling 20 ms average, NO stability requirement */
     if (g_weight_g > MAX_WEIGHT_G) {
@@ -1564,20 +2347,31 @@ static void cmd_open(const char *raw, uint32_t seq) {
 
     set_mode(MODE_UNLOCKING, seq);
     lock_disengage();
-    set_mode(MODE_OPENING, seq);
-    if (!post_servo_cmd(SRV_CMD_TORQUE_ON, 0, seq)) return;
-    if (!post_servo_cmd(SRV_CMD_GOAL, SERVO_POS_OPEN, seq)) return;
-
-    if (!wait_for_limit(&g_lim_open, ENDSTOP_TIMEOUT_MS, seq)) {
-        if (!g_fault_latched) {
-            fault_raise(FAULT_ENDSTOP_TIMEOUT, "open_timeout", 0, seq);
-        }
-        emit_cmd_complete(seq, "open", "fault",
-                          (g_fault == FAULT_ENDSTOP_TIMEOUT) ? "open_timeout" : FAULT_NAME[g_fault],
-                          ms_now() - t0, NULL);
+    if (atomic_load(&g_motion_abort)) {                     // [LOGIC-FIX] halted during the unlock delay
+        if (!g_fault_latched) set_mode(MODE_IDLE, seq);
         return;
     }
+    set_mode(MODE_OPENING, seq);
+    if (!g_lim_open) {                                      // [LOGIC-FIX] already at the switch: no motion
+        if (!post_servo_cmd(SRV_CMD_TORQUE_ON, 0, seq)) return;
+        if (!post_servo_cmd(SRV_CMD_RUN, SPEED_OPEN, seq)) return;            // [SWITCH-STOP]
 
+        if (!wait_for_limit(&g_lim_open, MOTION_ENDSTOP_TIMEOUT_MS, seq, SPEED_OPEN)) {      // [NO-POS-LIMIT]
+            if (atomic_load(&g_motion_abort)) {                // [NO-POS-LIMIT] halted
+                if (!g_fault_latched) set_mode(MODE_IDLE, seq);   // [LOGIC-FIX]
+                return;
+            }
+            if (!g_fault_latched) {
+                fault_raise(FAULT_ENDSTOP_TIMEOUT, "open_timeout", 0, seq);
+            }
+            emit_cmd_complete(seq, "open", "fault",
+                              (g_fault == FAULT_ENDSTOP_TIMEOUT) ? "open_timeout" : FAULT_NAME[g_fault],
+                              ms_now() - t0, NULL);
+            return;
+        }
+
+        (void)post_servo_cmd(SRV_CMD_STOP, 0, seq);            // [SWITCH-STOP] switch → stop, hold
+    }
     set_mode(MODE_OPEN, seq);
     emit_cmd_complete(seq, "open", "ok", NULL, ms_now() - t0,
                       ",\"tray\":\"opened\"");
@@ -1585,25 +2379,36 @@ static void cmd_open(const char *raw, uint32_t seq) {
 
 static void cmd_close(const char *raw, uint32_t seq) {
     (void)raw;
-    if (g_mode != MODE_OPEN) { emit_nak(seq, "bad_state"); return; }
+#if BENCH_MODE                                              // [BENCH] no mode checks
+    /* any state: runs toward CLOSED until the closed limit switch */
+#else
+    if (!(g_mode == MODE_OPEN || g_mode == MODE_IDLE)) { emit_nak(seq, "bad_state"); return; }   // [HALT-RESUME]
+#endif
 
     uint32_t t0 = ms_now();
     emit_ack(seq);
 
     set_mode(MODE_CLOSING, seq);
-    if (!post_servo_cmd(SRV_CMD_TORQUE_ON, 0, seq)) return;
-    if (!post_servo_cmd(SRV_CMD_GOAL, SERVO_POS_CLOSED, seq)) return;
+    if (!g_lim_closed) {                                    // [LOGIC-FIX] already at the switch: no motion
+        if (!post_servo_cmd(SRV_CMD_TORQUE_ON, 0, seq)) return;
+        if (!post_servo_cmd(SRV_CMD_RUN, SPEED_CLOSE, seq)) return;           // [SWITCH-STOP]
 
-    if (!wait_for_limit(&g_lim_closed, ENDSTOP_TIMEOUT_MS, seq)) {
-        if (!g_fault_latched) {
-            fault_raise(FAULT_ENDSTOP_TIMEOUT, "close_timeout", 0, seq);
+        if (!wait_for_limit(&g_lim_closed, MOTION_ENDSTOP_TIMEOUT_MS, seq, SPEED_CLOSE)) {   // [NO-POS-LIMIT]
+            if (atomic_load(&g_motion_abort)) {                // [NO-POS-LIMIT] halted
+                if (!g_fault_latched) set_mode(MODE_IDLE, seq);   // [LOGIC-FIX]
+                return;
+            }
+            if (!g_fault_latched) {
+                fault_raise(FAULT_ENDSTOP_TIMEOUT, "close_timeout", 0, seq);
+            }
+            emit_cmd_complete(seq, "close", "fault",
+                              (g_fault == FAULT_ENDSTOP_TIMEOUT) ? "close_timeout" : FAULT_NAME[g_fault],
+                              ms_now() - t0, NULL);
+            return;
         }
-        emit_cmd_complete(seq, "close", "fault",
-                          (g_fault == FAULT_ENDSTOP_TIMEOUT) ? "close_timeout" : FAULT_NAME[g_fault],
-                          ms_now() - t0, NULL);
-        return;
-    }
 
+        (void)post_servo_cmd(SRV_CMD_STOP, 0, seq);            // [SWITCH-STOP] switch → stop
+    }
     set_mode(MODE_LOCKING, seq);
     lock_engage();
     (void)post_servo_cmd(SRV_CMD_TORQUE_OFF, 0, seq);
@@ -1612,6 +2417,7 @@ static void cmd_close(const char *raw, uint32_t seq) {
     float weight = g_weight_g;
 
     set_mode(MODE_CLOSED_LOCKED, seq);
+    g_homed = true;                          // [HALT-RESUME] closed switch reached = homed
 
     char extras[80];
     int n = snprintf(extras, sizeof(extras),
@@ -1619,6 +2425,95 @@ static void cmd_close(const char *raw, uint32_t seq) {
     if (n < 0 || n >= (int)sizeof(extras)) extras[0] = '\0';
     emit_cmd_complete(seq, "close", "ok", NULL, ms_now() - t0, extras);
 }
+
+// [MOTION-SUP] begin
+#if MOTION_BENCH_JOG
+/* ---------- Bench / assembly only: goto + jog (wheel mode) ------------- *
+ * Runs at MOTION_SPEED in one direction. Stops on: the requested travel
+ * distance, the limit switch in the direction of travel, stall/wrong-dir
+ * (latched fault), any fault, or ENDSTOP_TIMEOUT_MS (then stops, no fault).
+ * Leaves torque on at speed 0 (send halt to go limp). Clears homed. Does
+ * NOT touch the lock — send unlock first.                                  */
+static void jog_run(const char *name, int16_t speed, int32_t dist, uint32_t seq) {
+    tray_mode_t m = g_mode;
+    if (!(m == MODE_IDLE || m == MODE_CLOSED_LOCKED || m == MODE_OPEN)) {
+        emit_nak(seq, "bad_state");
+        return;
+    }
+    if (!pos_fresh()) { emit_nak(seq, "no_position"); return; }
+    const bool     toward_open = ((speed > 0) == (MOTION_OPEN_DIR > 0));
+    volatile bool *stop_lim    = toward_open ? &g_lim_open : &g_lim_closed;
+    if (*stop_lim) { emit_nak(seq, "at_limit"); return; }
+
+    uint32_t t0 = ms_now();
+    emit_ack(seq);
+    g_homed = false;
+    set_mode(toward_open ? MODE_OPENING : MODE_CLOSING, seq);   /* motion-mode supervision */
+    if (!post_servo_cmd(SRV_CMD_TORQUE_ON, 0, seq)) return;
+    if (!post_servo_cmd(SRV_CMD_RUN, speed, seq)) return;
+
+    const bool  feed_wdt = (esp_task_wdt_status(NULL) == ESP_OK);
+    const char *stopped  = "timeout";
+    bool        faulted  = false;
+    stall_mon_t mon;
+    stall_mon_init(&mon, (int8_t)((speed < 0) ? -1 : 1));
+    while ((ms_now() - t0) < ENDSTOP_TIMEOUT_MS) {
+        if (feed_wdt) esp_task_wdt_reset();
+        if (g_fault_latched) { faulted = true; break; }
+        if (atomic_load(&g_motion_abort)) { stopped = "halted"; break; }   // [NO-POS-LIMIT]
+        if (*stop_lim) { stopped = toward_open ? "limit_open" : "limit_closed"; break; }
+        if (stall_mon_check(&mon, seq, 0)) { faulted = true; break; }
+        if (mon.travel >= dist - MOTION_ARRIVE_TOL) { stopped = "distance"; break; }
+        vTaskDelay_ms(10);
+    }
+
+    char extras[112];
+    if (faulted) {
+        int n = snprintf(extras, sizeof(extras), ",\"position\":%ld,\"travel\":%ld",
+                         (long)g_motor_pos, (long)mon.travel);
+        if (n < 0 || n >= (int)sizeof(extras)) extras[0] = '\0';
+        emit_cmd_complete(seq, name, "fault", FAULT_NAME[g_fault], ms_now() - t0, extras);
+        return;
+    }
+    (void)post_servo_cmd(SRV_CMD_STOP, 0, seq);
+    set_mode(MODE_IDLE, seq);
+    int n = snprintf(extras, sizeof(extras),
+                     ",\"stopped\":\"%s\",\"position\":%ld,\"travel\":%ld,\"dir\":\"%s\"",
+                     stopped, (long)g_motor_pos, (long)mon.travel,
+                     toward_open ? "open" : "close");
+    if (n < 0 || n >= (int)sizeof(extras)) extras[0] = '\0';
+    ESP_LOGW(TAG, "%s: stopped=%s pos=%ld travel=%ld (homed cleared)",
+             name, stopped, (long)g_motor_pos, (long)mon.travel);
+    emit_cmd_complete(seq, name, "ok", NULL, ms_now() - t0, extras);
+}
+
+/* {"cmd":"jog","steps":N}  N = ±1..4095 counts; + = toward OPEN, - = toward CLOSED */
+static void cmd_jog(const char *raw, uint32_t seq) {
+    int32_t steps = 0;
+    if (!parse_json_int_field(raw, "steps", &steps) || steps == 0 ||
+        steps < -4095 || steps > 4095) {
+        reply_bad_arg("jog", seq, "steps_missing_or_out_of_range");
+        return;
+    }
+    jog_run("jog", (steps > 0) ? SPEED_OPEN : SPEED_CLOSE, (steps > 0) ? steps : -steps, seq);
+}
+
+/* {"cmd":"goto","pos":N}  N = 0..4095 encoder count (straight difference, no wrap) */
+static void cmd_goto(const char *raw, uint32_t seq) {
+    int32_t target = 0;
+    if (!parse_json_int_field(raw, "pos", &target) || target < 0 || target > 4095) {
+        reply_bad_arg("goto", seq, "pos_missing_or_out_of_range");
+        return;
+    }
+    if (!pos_fresh()) { emit_nak(seq, "no_position"); return; }
+    int32_t d = target - g_motor_pos;
+    if (d > -MOTION_ARRIVE_TOL && d < MOTION_ARRIVE_TOL) { emit_nak(seq, "already_there"); return; }
+    /* count increases when speed sign == MOTION_ENC_SIGN */
+    int16_t speed = (int16_t)(((d > 0) ? MOTION_ENC_SIGN : -MOTION_ENC_SIGN) * MOTION_SPEED);
+    jog_run("goto", speed, (d > 0) ? d : -d, seq);
+}
+#endif /* MOTION_BENCH_JOG */
+// [MOTION-SUP] end
 
 /*  ============================================================================
  *   SECTION 21  ·  COMMAND DISPATCHER
@@ -1633,6 +2528,8 @@ typedef struct {
 
 static const cmd_entry_t CMD_TABLE[] = {
     { "nop",          cmd_nop          },
+    { "ping",         cmd_ping         },   // [COMMS-RX-WDT]
+    { "pong",         cmd_pong         },   // [DEV-PING]
     { "status",       cmd_status       },
     { "weigh",        cmd_weigh        },
     { "version",      cmd_version      },
@@ -1645,6 +2542,14 @@ static const cmd_entry_t CMD_TABLE[] = {
     { "selftest",     cmd_selftest     },
     { "tare",         cmd_tare         },
     { "set_scale",    cmd_set_scale    },
+    // [LC-CAL] begin
+    { "cal_known",    cmd_cal_known    },
+    { "read_raw",     cmd_read_raw     },
+    { "set_cal",      cmd_set_cal      },
+    { "get_cal",      cmd_get_cal      },
+    { "cal_reset",    cmd_cal_reset    },
+    { "save_cal",     cmd_save_cal     },
+    // [LC-CAL] end
     { "estop",        cmd_estop        },
     { "reset_fault",  cmd_reset_fault  },
     { "halt",         cmd_halt         },
@@ -1654,10 +2559,170 @@ static const cmd_entry_t CMD_TABLE[] = {
     { "home",         cmd_home         },
     { "open",         cmd_open         },
     { "close",        cmd_close        },
+#if MOTION_BENCH_JOG                                    // [MOTION-SUP]
+    { "goto",         cmd_goto         },
+    { "jog",          cmd_jog          },
+#endif
 };
 #define CMD_TABLE_LEN  ((sizeof(CMD_TABLE) / sizeof(CMD_TABLE[0])))
 
+// [COMMS-RX-WDT] begin
+static bool cmd_is_known(const char *cmd) {
+    for (size_t i = 0; i < CMD_TABLE_LEN; i++) {
+        if (strcmp(cmd, CMD_TABLE[i].name) == 0) return true;
+    }
+    return false;
+}
+// [COMMS-RX-WDT] end
+
+// [COMMS-RX-WDT] begin
+/* Motion / actuation commands — blocked before the host link is armed and
+ * while FAULT_COMMS_LOST is latched. halt/estop are never blocked.        */
+static bool cmd_is_actuation(const char *cmd) {
+    static const char *const ACT[] = { "home", "open", "close", "lock", "unlock",
+                                       "goto", "jog",   // [MOTION-SUP]
+                                       NULL };
+    for (int i = 0; ACT[i]; i++) {
+        if (strcmp(cmd, ACT[i]) == 0) return true;
+    }
+    return false;
+}
+
+static bool cmd_is_known(const char *cmd);
+
+/* Called only from the UART1 (host) path, after a line parsed into a known
+ * command. Console (UART0 / USB-JTAG) traffic never reaches here.         */
+static void comms_note_host_rx(void) {
+    atomic_store(&g_comms_rx_flag, true);
+    bool was_armed = atomic_exchange(&g_comms_armed, true);
+
+    bool restored;
+    taskENTER_CRITICAL(&g_comms_mux);
+    bool lost = g_fault_latched && (g_fault == FAULT_COMMS_LOST);
+    restored  = lost && !g_comms_rx_since_fault;
+    if (lost) g_comms_rx_since_fault = true;
+    taskEXIT_CRITICAL(&g_comms_mux);
+
+    /* logging outside the critical section */
+    if (!was_armed) ESP_LOGI(TAG, "COMMS armed (first valid host message)");
+    if (restored)   ESP_LOGW(TAG, "COMMS restored, fault still latched (send reset_fault)");
+}
+
+/* safety_task, every loop. One window = COMMS_CHECK_INTERVAL_MS. */
+/* One window passed or failed: shared by both comms-check modes. */
+static void comms_window_result(bool passed, uint32_t window_ms, const char *what) {
+    if (passed) {
+        atomic_store(&g_comms_fail_cnt, 0u);
+        return;
+    }
+    uint32_t fails = atomic_load(&g_comms_fail_cnt);
+    if (fails < COMMS_MAX_FAILS) {
+        fails++;
+        atomic_store(&g_comms_fail_cnt, fails);
+    }
+
+    bool raise;
+    taskENTER_CRITICAL(&g_comms_mux);
+    raise = (fails >= COMMS_MAX_FAILS) && !g_fault_latched;
+    if (raise) g_comms_rx_since_fault = false;
+    taskEXIT_CRITICAL(&g_comms_mux);
+
+    ESP_LOGW(TAG, "COMMS no %s %" PRIu32 "/%d", what, fails, COMMS_MAX_FAILS);
+    if (raise) {
+        fault_raise(FAULT_COMMS_LOST, "host_silent", (int32_t)(fails * window_ms), 0);
+    }
+}
+
+// [DEV-PING] begin
+#if COMMS_DEVICE_PING_ENABLE
+static void comms_send_ping(void) {
+    uint32_t seq = atomic_load(&g_comms_ping_seq) + 1u;
+    if (seq == 0) seq = 1;                    /* 0 is reserved for "no seq" */
+    atomic_store(&g_comms_ping_seq, seq);
+    uart1_send_json("{\"cmd\":\"ping\",\"seq\":%u" TRAILER_FMT "}", (unsigned)seq, TRAILER_ARGS);
+}
+#endif
+// [DEV-PING] end
+
+/* safety_task, every loop. */
+static void comms_rx_window_check(uint32_t now) {
+    static uint32_t win_start = 0;
+
+#if COMMS_TEST_SELF_HEARTBEAT
+    /* BENCH ONLY: feed the check internally so it never faults. */
+    atomic_store(&g_comms_armed, true);
+    atomic_store(&g_comms_rx_flag, true);
+    atomic_store(&g_comms_pong_flag, true);
+#endif
+
+#if COMMS_DEVICE_PING_ENABLE
+    // [DEV-PING] begin
+    /* Pings go out from boot (the host cannot answer otherwise); misses are
+     * only counted once armed by the first valid host message.            */
+    static bool started = false;
+    if (!started) {
+        started   = true;
+        win_start = now;
+        comms_send_ping();
+        return;
+    }
+    if ((now - win_start) < COMMS_PING_INTERVAL_MS) return;
+    win_start = now;
+    bool got_pong = atomic_exchange(&g_comms_pong_flag, false);
+    if (COMMS_COUNT_FROM_BOOT || atomic_load(&g_comms_armed))
+        comms_window_result(got_pong, COMMS_PING_INTERVAL_MS, "pong");
+    comms_send_ping();
+    // [DEV-PING] end
+#else
+    if (!atomic_load(&g_comms_armed)) { win_start = now; return; }
+    if ((now - win_start) < COMMS_CHECK_INTERVAL_MS) return;
+    win_start = now;
+    comms_window_result(atomic_exchange(&g_comms_rx_flag, false), COMMS_CHECK_INTERVAL_MS, "rx");
+#endif
+}
+
+// [NO-POS-LIMIT] begin
+static bool cmd_is_motion(const char *cmd) {
+    static const char *const MOV[] = { "home", "open", "close", "goto", "jog", NULL };
+    for (int i = 0; MOV[i]; i++) {
+        if (strcmp(cmd, MOV[i]) == 0) return true;
+    }
+    return false;
+}
+
+/* Hand a motion command to motion_task; one move at a time. */
+static void motion_enqueue(motion_fn_t fn, const char *line, uint32_t seq) {
+    if (!g_motor_bus_ready) {                                   // [BOOT-FIX]
+        ESP_LOGW(TAG, "motion cmd rejected: servo not detected");
+        emit_nak(seq, "no_servo");
+        return;
+    }
+    if (g_motion_q == NULL || atomic_exchange(&g_motion_busy, true)) {
+        ESP_LOGW(TAG, "motion cmd rejected: a move is already running");
+        emit_nak(seq, "busy");
+        return;
+    }
+    static motion_req_t req;              /* only touched under g_motion_busy */
+    req.fn  = fn;
+    req.seq = seq;
+    strncpy(req.raw, line, sizeof(req.raw) - 1);
+    req.raw[sizeof(req.raw) - 1] = '\0';
+    atomic_store(&g_motion_abort, false);
+    if (xQueueSend(g_motion_q, &req, 0) != pdPASS) {
+        atomic_store(&g_motion_busy, false);
+        emit_nak(seq, "busy");
+    }
+}
+// [NO-POS-LIMIT] end
+
+static void dispatch_line_src(const char *line, size_t len, bool from_host);
+
 static void dispatch_line(const char *line, size_t len) {
+    dispatch_line_src(line, len, false);       /* console path */
+}
+// [COMMS-RX-WDT] end
+
+static void dispatch_line_src(const char *line, size_t len, bool from_host) {   // [COMMS-RX-WDT] signature
     (void)len;
     char cmd[32];
     if (!parse_json_cmd(line, cmd, sizeof(cmd))) {
@@ -1674,13 +2739,42 @@ static void dispatch_line(const char *line, size_t len) {
     g_last_rx_ms = ms_now();
     g_rx_line_count++;
 
+    // [COMMS-RX-WDT] begin
+    if (from_host && cmd_is_known(cmd)) comms_note_host_rx();
+    // [DEV-PING] begin
+    if (from_host && strcmp(cmd, "pong") == 0) {
+        uint32_t want = atomic_load(&g_comms_ping_seq);
+        if (seq == 0 || seq == want) atomic_store(&g_comms_pong_flag, true);
+        else ESP_LOGW(TAG, "stale pong seq=%u (expected %u) ignored", (unsigned)seq, (unsigned)want);
+    }
+    // [DEV-PING] end
+
+    if (cmd_is_actuation(cmd)) {
+        if (!atomic_load(&g_comms_armed)) {
+            ESP_LOGW(TAG, "cmd '%s' rejected: no host message since boot", cmd);
+            emit_nak(seq, "no_host");
+            return;
+        }
+        if (g_fault_latched && g_fault == FAULT_COMMS_LOST) {
+            ESP_LOGW(TAG, "cmd '%s' rejected: COMMS_LOST latched", cmd);
+            emit_nak(seq, "fault_latched");
+            return;
+        }
+    }
+    // [COMMS-RX-WDT] end
+
     if (g_fault_latched && !fault_is_cmd_allowed(cmd)) {
+        ESP_LOGW(TAG, "cmd '%s' rejected: fault_latched (%s)", cmd, FAULT_NAME[g_fault]);   // [COMMS-RX-WDT] log
         emit_nak(seq, "fault_latched");
         return;
     }
 
     for (size_t i = 0; i < CMD_TABLE_LEN; i++) {
         if (strcmp(cmd, CMD_TABLE[i].name) == 0) {
+            if (cmd_is_motion(cmd)) {                             // [NO-POS-LIMIT]
+                motion_enqueue(CMD_TABLE[i].handler, line, seq);
+                return;
+            }
             CMD_TABLE[i].handler(line, seq);
             return;
         }
@@ -1689,11 +2783,33 @@ static void dispatch_line(const char *line, size_t len) {
     emit_nak(seq, "unknown_cmd");
 }
 
+// [NO-POS-LIMIT] begin
+/*  ============================================================================
+ *   SECTION 21.5  ·  motion_task     P2 · core 1 · event-driven
+ *     Runs home / open / close / jog / goto one at a time, so json_cmd_task
+ *     and console_task stay free to serve halt / estop / ping while the
+ *     motor runs (indefinitely, until its limit switch).
+ *  ========================================================================= */
+static void motion_task(void *arg) {
+    (void)arg;
+    ESP_ERROR_CHECK(esp_task_wdt_add(NULL));
+    static motion_req_t req;
+    for (;;) {
+        esp_task_wdt_reset();
+        if (xQueueReceive(g_motion_q, &req, pdMS_TO_TICKS(500)) == pdPASS) {
+            req.fn(req.raw, req.seq);
+            atomic_store(&g_motion_busy, false);
+        }
+    }
+}
+// [NO-POS-LIMIT] end
+
 /*  ============================================================================
  *   SECTION 22  ·  safety_task      P4 · core 0 · 1 ms
  *     - WDT reset
  *     - limit_poll (8-sample debounce) + limit_hit edge emission
- *     - comms watchdog (3 s host silence → COMMS_LOST)
+ *     - comms watchdog [DEV-PING]: ping every 15 s, 3 missed pongs
+ *       → COMMS_LOST
  *     NO ESTOP pin check — e-stop is command-only (ICD v3.1.8).
  *  ========================================================================= */
 
@@ -1725,14 +2841,9 @@ static void safety_task(void *arg) {
         g_lim_open_prev   = g_lim_open;
         g_lim_closed_prev = g_lim_closed;
 
-        /* ---------------------------------------------------------------- *
-         * Comms watchdog REMOVED by design decision (v1.3.2).              *
-         *   Host silence no longer triggers FAULT_COMMS_LOST.              *
-         *   g_last_rx_ms is still tracked and exposed via diag for         *
-         *   host-side debugging ("time since last valid cmd").             *
-         *   SOP §14 deviation — see file header comment.                   *
-         * ---------------------------------------------------------------- */
-        (void)past_grace;    /* now only used by limit-switch boot grace */
+        // [COMMS-RX-WDT] begin
+        comms_rx_window_check(ms_now());
+        // [COMMS-RX-WDT] end
 
         vTaskDelay_ms(SAFETY_PERIOD_MS);
     }
@@ -1821,34 +2932,53 @@ static void status_eval_temp(int32_t temp_c, uint32_t seq_hint) {
 
 static void status_execute_queue_cmd(const srv_cmd_t *c) {
     switch (c->type) {
-        case SRV_CMD_GOAL: {
-            esp_err_t err = servo_set_goal(SERVO_ID, c->goal_pos);
+        // [SWITCH-STOP] begin
+        case SRV_CMD_RUN: {
+            if (atomic_load(&g_motion_abort)) break;     // [NO-POS-LIMIT] halted: never restart
+            esp_err_t err = servo_set_speed(SERVO_ID, c->speed);
             if (err != ESP_OK) {
-                /* No/garbled status reply — check whether the goal landed anyway. */
-                uint8_t rb[2];
-                uint16_t want = (c->goal_pos > 4095) ? 4095 : c->goal_pos;
-                if (servo_read(SERVO_ID, SREG_GOAL_POS, 2, rb) == ESP_OK &&
+                /* No/garbled status reply — check whether the speed landed anyway. */
+                uint8_t  rb[2];
+                uint16_t want = servo_speed_word(c->speed);
+                if (servo_read(SERVO_ID, SREG_GOAL_SPEED, 2, rb) == ESP_OK &&
                     ((uint16_t)rb[0] | ((uint16_t)rb[1] << 8)) == want) {
-                    ESP_LOGW(TAG, "goal_write reply %s but readback ok (%u)",
-                             esp_err_to_name(err), (unsigned)want);
+                    ESP_LOGW(TAG, "run_write reply %s but readback ok", esp_err_to_name(err));
                 } else {
-                    ESP_LOGE(TAG, "goal_write failed: %s", esp_err_to_name(err));
-                    fault_raise(FAULT_BUS_BUSY, "goal_write", (int32_t)c->goal_pos, c->origin_seq);
+                    ESP_LOGE(TAG, "run_write failed: %s", esp_err_to_name(err));
+                    fault_raise(FAULT_BUS_BUSY, "run_write", c->speed, c->origin_seq);
                 }
             }
             break;
         }
+        // [SWITCH-STOP] end
         case SRV_CMD_TORQUE_OFF:
+            (void)servo_set_speed(SERVO_ID, 0);          // [SWITCH-STOP] never leave a stale speed
             (void)servo_set_torque(SERVO_ID, false);
             break;
         case SRV_CMD_TORQUE_ON:
             if (g_fault_latched) break;
+            if (atomic_load(&g_motion_abort)) break;     // [NO-POS-LIMIT] halted
+            (void)servo_set_speed(SERVO_ID, 0);          // [SWITCH-STOP] no surprise run on enable
             if (servo_set_torque(SERVO_ID, true) != ESP_OK)
                 ESP_LOGW(TAG, "torque_on write got no valid reply");
             break;
         case SRV_CMD_REBOOT:
             (void)servo_reboot_cmd(SERVO_ID);
             break;
+        // [SWITCH-STOP] begin
+        case SRV_CMD_STOP:
+            /* Limit switch reached: speed 0, torque stays on (holds).
+             * If that cannot be confirmed, fail limp rather than keep running. */
+            if (servo_set_speed(SERVO_ID, 0) != ESP_OK) {
+                uint8_t rb[2];
+                if (!(servo_read(SERVO_ID, SREG_GOAL_SPEED, 2, rb) == ESP_OK &&
+                      (rb[0] | rb[1]) == 0)) {
+                    ESP_LOGW(TAG, "stop failed — torque off instead");
+                    (void)servo_set_torque(SERVO_ID, false);
+                }
+            }
+            break;
+        // [SWITCH-STOP] end
         default:
             ESP_LOGW(TAG, "unknown servo_cmd type %d", (int)c->type);
             break;
@@ -1865,7 +2995,33 @@ static void status_task(void *arg) {
     uint32_t last_bad_read_warn_ms = 0;
 
     /* Keep feeding the WDT while the servo is unpowered/absent. */
-    while (!g_motor_bus_ready) { esp_task_wdt_reset(); vTaskDelay_ms(10); }
+// [BOOT-FIX] begin
+    /* Servo absent at boot (e.g. motor powered after the ESP32): keep
+     * pinging every 2 s and configure it as soon as it answers. Queued
+     * servo commands are dropped meanwhile (motion is refused anyway). */
+    {
+        uint32_t last_try = ms_now();
+        while (!g_motor_bus_ready) {
+            esp_task_wdt_reset();
+            srv_cmd_t drop;
+            while (xQueueReceive(g_servo_cmd_q, &drop, 0) == pdPASS) { }
+            if ((ms_now() - last_try) >= 2000) {
+                last_try = ms_now();
+                if (servo_ping(SERVO_ID) == ESP_OK) {
+                    ESP_LOGI(TAG, "motor response detected (servo id 0x%02X, late)", SERVO_ID);
+                    uart1_send_json("{\"event\":\"servo_detected\",\"seq\":0,"
+                                    "\"detected\":true,\"id\":%u,\"late\":true"
+                                    TRAILER_FMT "}", (unsigned)SERVO_ID, TRAILER_ARGS);
+                    servo_configure_protection(SERVO_ID);
+                    (void)servo_set_speed(SERVO_ID, 0);
+                    (void)servo_set_torque(SERVO_ID, false);
+                    g_motor_bus_ready = true;
+                }
+            }
+            vTaskDelay_ms(10);
+        }
+    }
+    // [BOOT-FIX] end
 
     for (;;) {
         esp_task_wdt_reset();
@@ -1931,11 +3087,33 @@ static void status_task(void *arg) {
                 good_cycle = false;
             }
 
-            if (!g_fault_latched &&
-                servo_read(SERVO_ID, SREG_PRESENT_POS, 2, rbuf) == ESP_OK) {
+            if (servo_read(SERVO_ID, SREG_PRESENT_POS, 2, rbuf) == ESP_OK) {   // [LOGIC-FIX] also while latched
                 int32_t p = (int32_t)rbuf[0] | ((int32_t)rbuf[1] << 8);
-                if (p >= 0 && p <= 4095) g_motor_pos = p;
+                if (p >= 0 && p <= 4095) {
+                    g_motor_pos    = p;
+                    g_motor_pos_ms = ms_now();      // [MOTION-SUP]
+                }
             }
+
+            // [RPM] begin
+            if (servo_read(SERVO_ID, SREG_PRESENT_SPEED, 2, rbuf) == ESP_OK) {   // [LOGIC-FIX] no stale rpm after a fault
+                uint16_t w = (uint16_t)rbuf[0] | ((uint16_t)rbuf[1] << 8);
+                int32_t  sps = (int32_t)(w & 0x7FFF);
+                g_motor_speed_sps = (w & 0x8000) ? -sps : sps;
+            }
+            {   /* 1 Hz motion log while a move is running */
+                static uint32_t last_mlog = 0;
+                tray_mode_t m = g_mode;
+                bool moving = (m == MODE_HOMING || m == MODE_OPENING || m == MODE_CLOSING);
+                if (moving && (ms_now() - last_mlog) >= 1000) {
+                    last_mlog = ms_now();
+                    ESP_LOGI(TAG, "motion %s: pos=%ld rpm=%.1f I=%ld mA V=%.1f T=%ld C",
+                             mode_name(m), (long)g_motor_pos, (double)motor_rpm(),
+                             (long)g_motor_current_ma, g_motor_voltage_dv / 10.0,
+                             (long)g_motor_temp_c);
+                }
+            }
+            // [RPM] end
 
             if (good_cycle) {
                 g_motor_bad_reads_consec = 0;
@@ -1991,7 +3169,9 @@ static void status_task(void *arg) {
         if ((ms_now() - last_hb_ms) >= HEARTBEAT_PERIOD_MS) {
             last_hb_ms = ms_now();
             emit_heartbeat();
-            gpio_set_level(PIN_STATUS_LED, 1 - gpio_get_level(PIN_STATUS_LED));
+            static bool led_on = false;                      // [LOGIC-FIX] output-only pin: never read back
+            led_on = !led_on;
+            gpio_set_level(PIN_STATUS_LED, led_on ? 1 : 0);
         }
 
         /* 4. Drain servo_cmd_q (all pending commands this tick) */
@@ -2031,7 +3211,7 @@ static void json_cmd_task(void *arg) {
             if (c == '\n' || c == '\r') {
                 if (pos > 0) {
                     line[pos] = '\0';
-                    dispatch_line(line, pos);
+                    dispatch_line_src(line, pos, true);   // [COMMS-RX-WDT] host path
                     pos = 0;
                 }
             } else if (pos < JSON_LINE_MAX_IN) {
@@ -2120,6 +3300,35 @@ static void console_dispatch_set_scale(const char *after_keyword) {
     if (n > 0 && n < (int)sizeof(synth)) dispatch_line(synth, (size_t)n);
 }
 
+// [BENCH] begin
+#if MOTION_BENCH_JOG
+/* "<keyword> <int>" → {"cmd":"<cmd>","<field>":<int>} through the same dispatcher. */
+static void console_dispatch_int(const char *cmd, const char *field, const char *after_keyword) {
+    const char *p = after_keyword;
+    while (*p == ' ' || *p == '\t' || *p == '=') p++;
+    bool neg = false;
+    if (*p == '-' || *p == '+') { neg = (*p == '-'); p++; }
+    if (*p < '0' || *p > '9') {
+        char w[96];
+        int n = snprintf(w, sizeof(w), "\r\n[console] %s: expected a number (e.g. '%s 200')\r\n",
+                         cmd, cmd);
+        if (n > 0 && n < (int)sizeof(w)) console_write_all(w, (size_t)n);
+        return;
+    }
+    int32_t val = 0;
+    int     digits = 0;
+    while (*p >= '0' && *p <= '9' && digits < 6) {
+        val = val * 10 + (*p - '0');
+        p++; digits++;
+    }
+    if (neg) val = -val;
+    static char synth[80];
+    int n = snprintf(synth, sizeof(synth), "{\"cmd\":\"%s\",\"%s\":%ld}", cmd, field, (long)val);
+    if (n > 0 && n < (int)sizeof(synth)) dispatch_line(synth, (size_t)n);
+}
+#endif
+// [BENCH] end
+
 static void console_print_help(void) {
     static const char help[] =
         "\r\n--- sediment tray console (type keyword, press Enter) ---\r\n"
@@ -2128,8 +3337,14 @@ static void console_print_help(void) {
         "            pos_query  motor_diag  servo_status  raw_counts\r\n"
         "            get_scale  selftest\r\n"
         "  Loadcell: tare   set_scale <N>\r\n"
+        "            JSON (paste): {\"cmd\":\"cal_known\",\"mass_g\":500}\r\n"     // [LC-CAL]
+        "            read_raw  set_cal  get_cal  cal_reset  save_cal\r\n"
         "  Safety:   estop  reset_fault  halt  servo_reboot\r\n"
         "  Manual:   lock   unlock\r\n"
+#if MOTION_BENCH_JOG                                                         // [BENCH]
+        "  BENCH:    jog <+N|-N>  (+ = toward OPEN, stops at switch)\r\n"
+        "            goto <0..4095>   halt = torque off   (no Ethernet needed)\r\n"
+#endif
         "  Meta:     help | ?\r\n"
         "  JSON also accepted on this port.\r\n"
         "----------------------------------------------------------\r\n";
@@ -2183,6 +3398,8 @@ static void console_handle_line(char *buf) {
         if (strcasestr_safe(buf, "servo_status")) { console_dispatch_short("servo_status"); return; }
         if (strcasestr_safe(buf, "servo_reboot")) { console_dispatch_short("servo_reboot"); return; }
         if (strcasestr_safe(buf, "reset_fault"))  { console_dispatch_short("reset_fault");  return; }
+        if (strcasestr_safe(buf, "reset") ||                                   // [BOOT-FIX] "reset fault" / "reset"
+            strcmp(buf, "rf") == 0 || strcmp(buf, "RF") == 0) { console_dispatch_short("reset_fault"); return; }
         if (strcasestr_safe(buf, "raw_counts"))   { console_dispatch_short("raw_counts");   return; }
         if (strcasestr_safe(buf, "pos_query"))    { console_dispatch_short("pos_query");    return; }
         if (strcasestr_safe(buf, "get_scale"))    { console_dispatch_short("get_scale");    return; }
@@ -2193,6 +3410,17 @@ static void console_handle_line(char *buf) {
         if (strcasestr_safe(buf, "selftest"))     { console_dispatch_short("selftest");     return; }
         if (strcasestr_safe(buf, "version"))      { console_dispatch_short("version");      return; }
         if (strcasestr_safe(buf, "unlock"))       { console_dispatch_short("unlock");       return; }
+
+        // [BENCH] begin
+#if MOTION_BENCH_JOG
+        {
+            const char *p = strcasestr_safe(buf, "jog");
+            if (p != NULL) { console_dispatch_int("jog", "steps", p + 3); return; }
+            p = strcasestr_safe(buf, "goto");
+            if (p != NULL) { console_dispatch_int("goto", "pos", p + 4); return; }
+        }
+#endif
+        // [BENCH] end
 
         /* --- SHORT single-word commands --- */
         if (strcasestr_safe(buf, "status"))       { console_dispatch_short("status");       return; }
@@ -2294,6 +3522,12 @@ static void console_task(void *arg) {
 
 static void weight_task(void *arg) {
     (void)arg;
+#if !LOADCELL_ENABLE                                        // [LC-OFF] never touch the HX711
+    g_weight_ok = false;
+    g_weight_g  = 0.0f;
+    ESP_LOGW(TAG, "load cell DISABLED (LOADCELL_ENABLE 0) — weight not read");
+    for (;;) vTaskDelay(pdMS_TO_TICKS(1000));
+#endif
     int32_t stable_ref = 0;
 
     for (;;) {
@@ -2301,6 +3535,20 @@ static void weight_task(void *arg) {
             int32_t r;
             xSemaphoreTake(g_lc_mutex, portMAX_DELAY);
             bool ok = hx711_read_blocking(&r, HX711_READ_TIMEOUT_US);
+            // [BOOT-FIX] begin
+            /* Full-scale code = HX711 with no / open load cell. Not a weight:
+             * mark weight invalid, keep the ring clean, never OVERWEIGHT. */
+            if (ok && (r >= 0x7FFFFF || r <= -0x800000)) {
+                static uint32_t last_sat_log = 0;
+                g_weight_ok = false;
+                ok = false;
+                if (last_sat_log == 0 || (ms_now() - last_sat_log) >= 10000) {
+                    last_sat_log = ms_now();
+                    ESP_LOGW(TAG, "HX711 reading saturated (%ld) — load cell not connected? weight invalid",
+                             (long)r);
+                }
+            }
+            // [BOOT-FIX] end
             if (ok) {
                 loadcell_push_sample(r);
                 int32_t avg = loadcell_current_avg();
@@ -2318,7 +3566,7 @@ static void weight_task(void *arg) {
 
             int32_t cur = g_lc_last_avg;
             float drift = fabsf((float)(cur - stable_ref) /
-                                (float)(g_lc_scale_cpg > 0 ? g_lc_scale_cpg : 1));
+                                (lc_scale_valid(g_lc_scale_cpg) ? g_lc_scale_cpg : 1.0f));   // [LC-CAL]
             if (drift <= WEIGHT_STABLE_EPSILON_G) {
                 if ((ms_now() - g_weight_stable_since_ms) >= WEIGHT_STABLE_WIN_MS) {
                     g_weight_stable = true;
@@ -2329,7 +3577,7 @@ static void weight_task(void *arg) {
                 stable_ref               = cur;
             }
 
-            if (g_weight_stable && g_weight_g > MAX_WEIGHT_G && !g_fault_latched) {
+            if (g_weight_ok && g_weight_stable && g_weight_g > MAX_WEIGHT_G && !g_fault_latched) {   // [BOOT-FIX] valid weight only
                 fault_raise(FAULT_OVERWEIGHT, "stable_over",
                             (int32_t)g_weight_g, 0);
             }
@@ -2445,6 +3693,7 @@ void app_main(void) {
                         TRAILER_FMT "}",
                         (unsigned)SERVO_ID, attempts, TRAILER_ARGS);
         servo_configure_protection(SERVO_ID);
+        (void)servo_set_speed(SERVO_ID, 0);              // [SWITCH-STOP] wheel mode: speed 0 first
         (void)servo_set_torque(SERVO_ID, false);
         g_motor_bus_ready = true;
     } else {
@@ -2458,6 +3707,9 @@ void app_main(void) {
 
     g_servo_cmd_q = xQueueCreate(SERVO_CMD_Q_DEPTH, sizeof(srv_cmd_t));
     if (!g_servo_cmd_q) { ESP_LOGE(TAG, "xQueueCreate failed"); esp_restart(); }
+
+    g_motion_q = xQueueCreate(1, sizeof(motion_req_t));                          // [NO-POS-LIMIT]
+    if (!g_motion_q) { ESP_LOGE(TAG, "motion queue create failed"); esp_restart(); }
 
     g_lc_mutex = xSemaphoreCreateMutex();
     if (!g_lc_mutex) { ESP_LOGE(TAG, "mutex create failed"); esp_restart(); }
@@ -2486,6 +3738,7 @@ void app_main(void) {
     xTaskCreatePinnedToCore(safety_task,   "safety",   4096, NULL, 4, NULL, 0);
     xTaskCreatePinnedToCore(status_task,   "status",   6144, NULL, 3, NULL, 0);
     xTaskCreatePinnedToCore(json_cmd_task, "json_cmd", 6144, NULL, 2, NULL, 1);
+    xTaskCreatePinnedToCore(motion_task,   "motion",   6144, NULL, 2, NULL, 1);   // [NO-POS-LIMIT]
     xTaskCreatePinnedToCore(weight_task,   "weight",   4096, NULL, 1, NULL, 1);
     /* Priority 6 — same as grabber's motor_task that this is modelled on.
      * Not pinned (grabber uses plain xTaskCreate).                        */
@@ -2493,6 +3746,20 @@ void app_main(void) {
 
     ESP_LOGI(TAG, "Sediment Tray FW v" FW_VERSION_STR " booted — boots=%" PRIu32
              " reset_cause=%d", g_boot_count, (int)g_reset_cause);
+    // [COMMS-RX-WDT] begin
+#if BENCH_MODE
+    ESP_LOGW(TAG, "*** BENCH_MODE: no Ethernet host needed, comms fault DISABLED, jog enabled — NOT FOR VEHICLE ***");
+#elif COMMS_TEST_SELF_HEARTBEAT
+    ESP_LOGW(TAG, "*** Ethernet comms check DISABLED (COMMS_TEST_SELF_HEARTBEAT 1) — no host needed. Set 0 for vehicle ***");
+#else
+#if COMMS_DEVICE_PING_ENABLE && COMMS_COUNT_FROM_BOOT
+    ESP_LOGI(TAG, "COMMS: ping every %d s on UART1, COMMS_LOST after %d missed pongs (counting from boot); "
+                  "no motion until the first host message", COMMS_PING_INTERVAL_MS / 1000, COMMS_MAX_FAILS);
+#else
+    ESP_LOGI(TAG, "COMMS watchdog: waiting for first host message on UART1 (no motion until then)");
+#endif
+#endif
+    // [COMMS-RX-WDT] end
 }
 
 /*  ============================================================================
